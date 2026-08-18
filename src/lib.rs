@@ -16,17 +16,17 @@
 ///
 /// ## Cross-language
 ///
-/// The whole API is exposed through a plain C ABI (`vgfx::*`, header in
+/// The whole API is exposed through a plain C ABI (`vgfx::ffi`, header in
 /// `include/vgfx.h`), so it can be called from C, C++, Python (ctypes),
 /// Go (cgo), Zig, Swift, etc.
 ///
 /// ## Quick start (Rust)
 ///
-/// ```ignore
+/// ```no_run
 /// use vgfx::prelude::*;
 ///
 /// // Offscreen 1280x720 target on the platform's native GPU backend.
-/// let mut renderer = vgfx::Renderer::offscreen(1280, 720).unwrap();
+/// let mut renderer = Renderer::offscreen(1280, 720).unwrap();
 ///
 /// renderer.begin_frame();
 /// renderer.set_background(Color::srgb(0.08, 0.09, 0.12, 1.0));
@@ -39,17 +39,29 @@
 /// renderer.set_camera_perspective(60.0, 16.0 / 9.0, 0.1, 100.0,
 ///     [0.0, 0.0, 3.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
 /// let cube = Mesh::cube(1.0);
-/// let model = glam::Mat4::from_rotation_z(0.6) * glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.0, 0.0));
+/// let model = glam::Mat4::from_rotation_z(0.6);
 /// renderer.draw_mesh(&cube, model, Color::srgb(0.3, 0.5, 0.9, 1.0));
 ///
-/// renderer.present();
+/// renderer.present().unwrap();
 /// renderer.save_png("out.png").unwrap();
 /// # drop(renderer);
 /// ```
+pub mod backend;
 pub mod error;
 pub mod ffi;
 pub mod geometry;
+pub mod scene;
 
+pub use backend::Renderer;
+pub use error::{Error, Result};
+pub use scene::{Camera, Color, Material, Mesh, Scene};
+
+/// Commonly used types.
 pub mod prelude {
-    pub use crate::error::{Error, Result};
+    pub use crate::geometry::{Affine, Path};
+    pub use crate::{
+        backend::Renderer,
+        error::{Error, Result},
+        scene::{Camera, Color, Item, Material, Mesh, Scene, TwoDItem, TwoDStyle},
+    };
 }

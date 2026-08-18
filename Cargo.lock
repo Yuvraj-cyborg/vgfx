@@ -1473,6 +1473,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "core-graphics-types",
  "glam",
  "image",
  "metal",

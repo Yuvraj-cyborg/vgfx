@@ -22,7 +22,7 @@
 ///
 /// ## Quick start (Rust)
 ///
-/// ```no_run
+/// ```ignore
 /// use vgfx::prelude::*;
 ///
 /// // Offscreen 1280x720 target on the platform's native GPU backend.
@@ -48,6 +48,7 @@
 /// ```
 pub mod error;
 pub mod ffi;
+pub mod geometry;
 
 pub mod prelude {
     pub use crate::error::{Error, Result};

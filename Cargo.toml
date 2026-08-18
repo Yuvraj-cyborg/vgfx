@@ -1,0 +1,24 @@
+[package]
+name = "vgfx"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-language, cross-platform 2D/3D vector graphics API that talks directly to the GPU (Metal on Apple, Vulkan elsewhere)."
+license = "MIT"
+
+[lib]
+name = "vgfx"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+metal = "0.29"
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+ash = "0.38"
+
+[dev-dependencies]
+winit = "0.30"

@@ -1,5 +1,5 @@
-//! Immediate-mode-ish scene description: 2D vector items and 3D mesh items,
-//! camera, materials.
+//! Scene description: colors, materials, camera, meshes and the
+//! per-frame item list consumed by a backend.
 
 pub mod camera;
 pub mod mesh;
@@ -7,4 +7,4 @@ pub mod scene;
 
 pub use camera::Camera;
 pub use mesh::{Mesh, Vertex3D};
-pub use scene::{Color, Material, Scene, TwoDItem, TwoDStyle, ThreeDItem};
+pub use scene::{Color, Item, Material, Scene, ThreeDItem, TwoDItem, TwoDStyle};

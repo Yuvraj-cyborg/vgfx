@@ -2,3 +2,6 @@
 *.png
 output/
 .DS_Store
+
+# build artifacts
+examples/c_example/c_example

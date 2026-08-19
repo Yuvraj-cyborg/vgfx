@@ -21,6 +21,7 @@ mod app {
         window: Option<Window>,
         renderer: Option<Renderer>,
         frame: u64,
+        scale: f64,
     }
 
     impl App {
@@ -96,15 +97,31 @@ mod app {
             );
             self.window = Some(window);
             self.renderer = Some(renderer);
+            self.window.as_ref().expect("window").request_redraw();
         }
 
         fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer: _ } => {
+                    self.scale = scale_factor;
+                    if let Some(win) = &self.window {
+                        let size = win.inner_size();
+                        if let Some(r) = &mut self.renderer {
+                            r.resize(
+                                (size.width as f64 * scale_factor).round() as u32,
+                                (size.height as f64 * scale_factor).round() as u32,
+                            );
+                        }
+                    }
+                }
                 WindowEvent::Resized(size) => {
                     if size.width > 0 && size.height > 0 {
                         if let Some(r) = &mut self.renderer {
-                            r.resize(size.width, size.height);
+                            r.resize(
+                                (size.width as f64 * self.scale).round() as u32,
+                                (size.height as f64 * self.scale).round() as u32,
+                            );
                         }
                     }
                 }
@@ -121,7 +138,7 @@ mod app {
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("event loop");
-        let mut app = App { window: None, renderer: None, frame: 0 };
+        let mut app = App { window: None, renderer: None, frame: 0, scale: 1.0 };
         event_loop.run_app(&mut app).expect("run event loop");
     }
 }

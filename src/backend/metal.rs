@@ -166,7 +166,7 @@ impl MetalBackend {
                 lib.get_function(name, None).map_err(|e| Error::Pipeline(format!("{name}: {e}")))
             };
 
-            let mut d2 = RenderPipelineDescriptor::new();
+            let d2 = RenderPipelineDescriptor::new();
             let f = get("v2d_vertex")?;
             let g = get("v2d_fragment")?;
             d2.set_vertex_function(Some(&f));
@@ -189,7 +189,7 @@ impl MetalBackend {
                 .new_render_pipeline_state(&d2)
                 .map_err(|e| Error::Pipeline(format!("2d pipeline: {e}")))?;
 
-            let mut d3 = RenderPipelineDescriptor::new();
+            let d3 = RenderPipelineDescriptor::new();
             let f = get("v3d_vertex")?;
             let g = get("v3d_fragment")?;
             d3.set_vertex_function(Some(&f));
@@ -208,7 +208,7 @@ impl MetalBackend {
     }
 
     fn make_depth_texture(&self, w: u32, h: u32) -> metal::Texture {
-        let mut desc = TextureDescriptor::new();
+        let desc = TextureDescriptor::new();
         desc.set_texture_type(MTLTextureType::D2);
         desc.set_width(w as u64);
         desc.set_height(h as u64);
@@ -219,7 +219,7 @@ impl MetalBackend {
     }
 
     fn make_offscreen_color(&self, w: u32, h: u32) -> metal::Texture {
-        let mut desc = TextureDescriptor::new();
+        let desc = TextureDescriptor::new();
         desc.set_texture_type(MTLTextureType::D2);
         desc.set_width(w as u64);
         desc.set_height(h as u64);
@@ -282,7 +282,7 @@ impl MetalBackend {
     fn depth_states(
         device: &Device,
     ) -> Result<(DepthStencilState, DepthStencilState)> {
-        let mut dd = DepthStencilDescriptor::new();
+        let dd = DepthStencilDescriptor::new();
         dd.set_depth_compare_function(MTLCompareFunction::Less);
         dd.set_depth_write_enabled(true);
         let dss_depth = device.new_depth_stencil_state(&dd);
@@ -355,7 +355,7 @@ impl Gpu for MetalBackend {
             }
         };
 
-        let mut pass = RenderPassDescriptor::new();
+        let pass = RenderPassDescriptor::new();
         {
             let ca = pass
                 .color_attachments()

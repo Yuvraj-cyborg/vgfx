@@ -1,3 +1,6 @@
+// objc 0.2's `sel_impl!` macro references `cfg(feature = "cargo-clippy")`.
+#![allow(unexpected_cfgs)]
+
 /// # vgfx
 ///
 /// A cross-language, cross-platform API for rendering 2D and 3D vector

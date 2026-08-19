@@ -11,15 +11,19 @@ use metal::{
     CommandQueue, CompileOptions, DepthStencilDescriptor, DepthStencilState, Device,
     MTLBlendFactor, MTLBlendOperation, MTLBlitOption, MTLCompareFunction, MTLClearColor,
     MTLLoadAction, MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MTLOrigin, MTLResourceOptions,
-    MTLSize, MTLStoreAction, MTLStorageMode, MTLTextureType, MTLTextureUsage,
-    MTLVertexFormat, MTLViewport, MetalDrawableRef, RenderPassDescriptor,
-    RenderPipelineDescriptor, RenderPipelineState, TextureDescriptor, VertexDescriptor,
+    MTLSize, MTLStoreAction, MTLStorageMode, MTLTextureType, MTLTextureUsage, MTLViewport,
+    MetalDrawableRef, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
+    TextureDescriptor,
 };
 
 use crate::backend::{make_u3d, Draw, Frame, Gpu, U2D};
 use crate::error::{Error, Result};
 use crate::scene::Camera;
 
+// Per-vertex data is read from [[buffer(0)]] indexed by [[vertex_id]]
+// (the `[[attribute(N)]]` form cannot be compiled from source on this
+// Metal version without a compile-time vertex descriptor). The packed
+// MSL layouts below match the Rust `V2D`/`Vertex3D` byte layouts.
 const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -28,21 +32,27 @@ struct U2D {
     float4 vp;
 };
 
+typedef struct {
+    packed_float2 position;
+    packed_float4 color;
+} V2D;
+
 struct V2DOut {
     float4 position [[position]];
     float4 color;
 };
 
 vertex V2DOut v2d_vertex(
-    float2 pos [[attribute(0)]],
-    float4 color [[attribute(1)]],
+    const device V2D* verts [[buffer(0)]],
+    unsigned int vid [[vertex_id]],
     constant U2D& u [[buffer(1)]])
 {
     V2DOut out;
     // Screen space (y-down) -> NDC (y-up).
-    float2 ndc = float2(pos.x / u.vp.x * 2.0 - 1.0, 1.0 - pos.y / u.vp.y * 2.0);
+    float2 p = verts[vid].position;
+    float2 ndc = float2(p.x / u.vp.x * 2.0 - 1.0, 1.0 - p.y / u.vp.y * 2.0);
     out.position = float4(ndc, 0.0, 1.0);
-    out.color = color;
+    out.color = float4(verts[vid].color);
     return out;
 }
 
@@ -61,6 +71,12 @@ struct U3D {
     float _pad;
 };
 
+typedef struct {
+    packed_float3 position;
+    packed_float3 normal;
+    packed_float4 color;
+} V3D;
+
 struct V3DOut {
     float4 position [[position]];
     float4 color;
@@ -69,16 +85,16 @@ struct V3DOut {
 };
 
 vertex V3DOut v3d_vertex(
-    float3 pos [[attribute(0)]],
-    float3 normal [[attribute(1)]],
-    float4 color [[attribute(2)]],
+    const device V3D* verts [[buffer(0)]],
+    unsigned int vid [[vertex_id]],
     constant U3D& u [[buffer(1)]])
 {
     V3DOut out;
-    out.position = u.mvp * float4(pos, 1.0);
-    out.world_pos = (u.model * float4(pos, 1.0)).xyz;
-    out.normal = normalize((u.model * float4(normal, 0.0)).xyz);
-    out.color = color;
+    float3 p = verts[vid].position;
+    out.position = u.mvp * float4(p, 1.0);
+    out.world_pos = (u.model * float4(p, 1.0)).xyz;
+    out.normal = normalize((u.model * float4(verts[vid].normal, 0.0)).xyz);
+    out.color = float4(verts[vid].color);
     return out;
 }
 
@@ -119,6 +135,7 @@ pub fn attach_layer_to_view(
     width: u32,
     height: u32,
 ) -> Result<MetalLayer> {
+    use metal::foreign_types::ForeignType;
     use metal::objc::msg_send;
     use metal::objc::runtime::Object;
     use metal::objc::sel;
@@ -132,7 +149,7 @@ pub fn attach_layer_to_view(
     layer.set_drawable_size(CGSize::new(width as f64, height as f64));
     unsafe {
         let view = ns_view as *mut Object;
-        let layer_id: *mut Object = std::mem::transmute(&layer);
+        let layer_id: *mut Object = layer.as_ptr() as *mut Object;
         let () = msg_send![view, setWantsLayer: true];
         let () = msg_send![view, setLayer: layer_id];
     }
@@ -140,17 +157,6 @@ pub fn attach_layer_to_view(
 }
 
 impl MetalBackend {
-    fn vertex_descriptor(specs: &[(MTLVertexFormat, u64)]) -> &metal::VertexDescriptorRef {
-        let vd = VertexDescriptor::new();
-        for (i, (fmt, off)) in specs.iter().enumerate() {
-            let a = vd.attributes().object_at(i as u64).unwrap();
-            a.set_format(*fmt);
-            a.set_offset(*off);
-            a.set_buffer_index(0);
-        }
-        vd
-    }
-
     fn build_pipelines(device: &Device) -> Result<(RenderPipelineState, RenderPipelineState)> {
         metal::objc::rc::autoreleasepool(|| {
             let lib = device
@@ -160,16 +166,11 @@ impl MetalBackend {
                 lib.get_function(name, None).map_err(|e| Error::Pipeline(format!("{name}: {e}")))
             };
 
-            let vd2d = Self::vertex_descriptor(&[
-                (MTLVertexFormat::Float2, 0),
-                (MTLVertexFormat::Float4, 8),
-            ]);
             let mut d2 = RenderPipelineDescriptor::new();
             let f = get("v2d_vertex")?;
             let g = get("v2d_fragment")?;
             d2.set_vertex_function(Some(&f));
             d2.set_fragment_function(Some(&g));
-            d2.set_vertex_descriptor(Some(vd2d));
             {
                 let att = d2
                     .color_attachments()
@@ -188,17 +189,11 @@ impl MetalBackend {
                 .new_render_pipeline_state(&d2)
                 .map_err(|e| Error::Pipeline(format!("2d pipeline: {e}")))?;
 
-            let vd3d = Self::vertex_descriptor(&[
-                (MTLVertexFormat::Float3, 0),
-                (MTLVertexFormat::Float3, 12),
-                (MTLVertexFormat::Float4, 24),
-            ]);
             let mut d3 = RenderPipelineDescriptor::new();
             let f = get("v3d_vertex")?;
             let g = get("v3d_fragment")?;
             d3.set_vertex_function(Some(&f));
             d3.set_fragment_function(Some(&g));
-            d3.set_vertex_descriptor(Some(vd3d));
             d3.set_depth_attachment_pixel_format(MTLPixelFormat::Depth32Float);
             d3.color_attachments()
                 .object_at(0)

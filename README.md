@@ -51,19 +51,18 @@ r.save_png("out.png").unwrap();
 Run the bundled examples (each feature has its own sub-folder):
 
 ```sh
-cargo run --example headless_render   # offscreen → output/*.png
-cargo run --example 2d_shapes
-cargo run --example 2d_paths
-cargo run --example 3d_mesh
-cargo run --example 3d_scene
+make run-2d        # cargo run --example offscreen_2d   → out.png (headless)
+make run-3d        # cargo run --example offscreen_3d   → out.png (headless)
+make run-windowed  # cargo run --example windowed       → interactive Metal window
 ```
 
-Windowed examples accept `--frames N` (auto-exit), `--width/--height`.
+`offscreen_2d`/`offscreen_3d` render to a PNG in the current directory
+(nothing GPU-interactive, so they also work in CI/headless setups).
 
 ## Cross-language (C ABI)
 
 ```sh
-make ffi-c     # builds staticlib + compiles examples/ffi_c/main.c → runs it
+make ffi-c     # builds the cdylib + compiles examples/c_example/main.c → runs it
 make ffi-py    # runs examples/ffi_python/render.py via ctypes against the cdylib
 ```
 

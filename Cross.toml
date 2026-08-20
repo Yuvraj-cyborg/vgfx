@@ -1,0 +1,18 @@
+# Cross-compilation via the `cross` Docker tool (https://github.com/cross-rs/cross).
+# Used by the CI workflow for Linux/Windows targets; on macOS the native
+# aarch64/x86_64 toolchains work without Docker.
+#
+# All dependencies (glam, bytemuck, image, ash) are pure Rust, so no system
+# libraries are needed for the build itself.
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
+
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:main"
+
+[target.x86_64-pc-windows-msvc]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-msvc:main"

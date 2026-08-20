@@ -72,18 +72,19 @@ From any language, link against `libvgfx.{a,so,dylib}` and include
 ## Cross-compilation
 
 ```sh
-make check-all        # cargo check for all supported targets
-make cross-linux-x86_64   # cargo zigbuild (or: cross build) → target/.../libvgfx.a
+make check-all                 # cargo check: native + x86_64-unknown-linux-gnu
+make cross-linux-aarch64       # cross build → target/aarch64-unknown-linux-gnu/...
+make cross-linux-x86_64
 make cross-windows
-make universal-mac    # lipo aarch64 + x86_64 dylib
 ```
 
 Prereqs (pick one):
+- `cargo install cross` — Docker-based, `Cross.toml` included
 - `cargo install cargo-zigbuild` (recommended, no Docker)
-- `cross` (Docker) — `Cross.toml` is included
 - plain `rustup target add` + a C cross-toolchain (musl/gnu)
 
-CI (`.github/workflows/ci.yml`) checks every target on every push.
+CI (`.github/workflows/ci.yml`) builds and tests macOS/Linux/Windows, and
+cross-checks aarch64-linux + windows-gnu on every push.
 
 ## License
 

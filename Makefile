@@ -1,7 +1,8 @@
 CARGO ?= cargo
 PYTHON ?= python3
 
-.PHONY: all build test run-2d run-3d run-windowed ffi-c ffi-py clean
+.PHONY: all build test run-2d run-3d run-windowed ffi-c ffi-py \
+	check-all cross-linux-aarch64 cross-linux-x86_64 cross-windows clean
 
 all: build
 
@@ -25,6 +26,19 @@ ffi-c:
 
 ffi-py: build
 	$(PYTHON) examples/ffi_python/render.py
+
+check-all:
+	$(CARGO) check --target aarch64-apple-darwin
+	$(CARGO) check --target x86_64-unknown-linux-gnu
+
+cross-linux-aarch64:
+	cross build --target aarch64-unknown-linux-gnu
+
+cross-linux-x86_64:
+	cross build --target x86_64-unknown-linux-gnu
+
+cross-windows:
+	cross build --target x86_64-pc-windows-gnu
 
 clean:
 	$(CARGO) clean

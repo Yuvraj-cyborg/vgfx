@@ -23,14 +23,29 @@ fn main() -> vgfx::Result<()> {
     );
 
     let cube = Mesh::cube(1.4);
-    let spin = glam::Mat4::from_rotation_z(0.7) * glam::Mat4::from_rotation_y(0.9);
-    r.draw_mesh(&cube, spin * glam::Mat4::from_translation(glam::Vec3::new(-1.6, 0.0, 0.0)), Color::srgb(0.35, 0.55, 0.95, 1.0));
+    let spin = vgfx::math::Mat4::from_rotation_z(0.7) * vgfx::math::Mat4::from_rotation_y(0.9);
+    r.draw_mesh(
+        cube,
+        spin * vgfx::math::Mat4::from_translation(vgfx::math::Vec3::new(-1.6, 0.0, 0.0)),
+        Color::srgb(0.35, 0.55, 0.95, 1.0),
+    );
 
     let sphere = Mesh::sphere(1.1, 32, 24);
-    r.draw_mesh(&sphere, glam::Mat4::from_translation(glam::Vec3::new(1.5, 0.0, 0.0)), Color::srgb(0.95, 0.45, 0.25, 1.0));
+    r.draw_mesh(
+        sphere,
+        vgfx::math::Mat4::from_translation(vgfx::math::Vec3::new(1.5, 0.0, 0.0)),
+        Color::srgb(0.95, 0.45, 0.25, 1.0),
+    );
 
     // 2D overlay on top of the 3D scene.
-    r.fill_rounded_rect(20.0, h as f32 - 60.0, 320.0, 40.0, 10.0, Color::srgb(0.0, 0.0, 0.0, 0.45));
+    r.fill_rounded_rect(
+        20.0,
+        h as f32 - 60.0,
+        320.0,
+        40.0,
+        10.0,
+        Color::srgb(0.0, 0.0, 0.0, 0.45),
+    );
 
     r.present()?;
     let out = "out.png";

@@ -7,5 +7,5 @@ pub mod tessellate;
 
 pub use affine::Affine;
 pub use path::{Path, PathCmd};
-pub use shapes::{circle, ellipse, polygon, rect, regular_polygon, rounded_rect};
-pub use tessellate::{fill, fill_polys, flatten, stroke, Subpath, Triangles, DEFAULT_TOLERANCE};
+pub use shapes::{ellipse, rounded_rect};
+pub use tessellate::{DEFAULT_TOLERANCE, Subpath, Triangles, fill, fill_polys, flatten, stroke};

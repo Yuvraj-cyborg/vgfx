@@ -1,4 +1,4 @@
-use glam::Vec2;
+use crate::math::Vec2;
 
 /// 2D affine transform (row-major 2x3): `p' = A * p + t`.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -13,7 +13,9 @@ impl Affine {
 
     #[must_use]
     pub const fn new(a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32) -> Self {
-        Affine { m: [[a, b, tx], [c, d, ty]] }
+        Affine {
+            m: [[a, b, tx], [c, d, ty]],
+        }
     }
 
     #[must_use]
@@ -26,10 +28,14 @@ impl Affine {
         Affine::new(sx, 0.0, 0.0, sy, 0.0, 0.0)
     }
 
+    /// Standard math rotation (counter-clockwise for +angle in y-up
+    /// coordinates): `x' = c*x - s*y`, `y' = s*x + c*y`.
+    ///
+    /// Screen-space y-down flipping is handled by the GPU shader, not here.
     #[must_use]
     pub fn rotate(rad: f32) -> Self {
         let (s, c) = rad.sin_cos();
-        Affine::new(c, s, -s, c, 0.0, 0.0)
+        Affine::new(c, -s, s, c, 0.0, 0.0)
     }
 
     /// `self * other` (apply `other` first).
@@ -77,10 +83,10 @@ mod tests {
 
     #[test]
     fn rotation_keeps_length() {
-        // y-down (screen) convention: +90deg turns +x (right) into -y (up).
+        // Standard math convention: +90deg turns +x (right) into +y (up).
         let r = Affine::rotate(std::f32::consts::PI / 2.0);
         let p = r.transform_point(Vec2::new(1.0, 0.0));
         assert!((p.x - 0.0).abs() < 1e-5);
-        assert!((p.y + 1.0).abs() < 1e-5);
+        assert!((p.y - 1.0).abs() < 1e-5);
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use glam::Mat4;
+use crate::math::Mat4;
 
 use crate::geometry::{Affine, Path};
 
@@ -8,6 +8,11 @@ use super::camera::Camera;
 use super::mesh::Mesh;
 
 /// RGBA color, components in [0, 1].
+///
+/// Despite the constructor name, no sRGB→linear conversion is performed:
+/// values are stored and rendered as-is. (Named `srgb` because callers
+/// typically pick colors from sRGB pickers; a future version may add real
+/// conversion — see the lighting note on [`Material`].)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {
     pub r: f32,
@@ -73,7 +78,11 @@ pub struct Material {
 
 impl Default for Material {
     fn default() -> Self {
-        Self { color: Color::WHITE, ambient: 0.25, specular: 0.35 }
+        Self {
+            color: Color::WHITE,
+            ambient: 0.25,
+            specular: 0.35,
+        }
     }
 }
 
@@ -111,6 +120,8 @@ impl Scene {
     }
 
     pub fn clear(&mut self) {
+        // Per-frame reset: drops recorded items, keeps background + camera
+        // (call `set_background` / `set_camera` again only when they change).
         self.items.clear();
     }
 
@@ -123,11 +134,19 @@ impl Scene {
     }
 
     pub fn fill_2d(&mut self, path: Path, color: Color) {
-        self.items.push(Item::TwoD(TwoDItem { path, style: TwoDStyle::Fill(color), transform: Affine::IDENTITY }));
+        self.items.push(Item::TwoD(TwoDItem {
+            path,
+            style: TwoDStyle::Fill(color),
+            transform: Affine::IDENTITY,
+        }));
     }
 
     pub fn stroke_2d(&mut self, path: Path, color: Color, width: f32) {
-        self.items.push(Item::TwoD(TwoDItem { path, style: TwoDStyle::Stroke { color, width }, transform: Affine::IDENTITY }));
+        self.items.push(Item::TwoD(TwoDItem {
+            path,
+            style: TwoDStyle::Stroke { color, width },
+            transform: Affine::IDENTITY,
+        }));
     }
 
     pub fn add_2d(&mut self, item: TwoDItem) {
@@ -135,7 +154,11 @@ impl Scene {
     }
 
     pub fn draw_3d(&mut self, mesh: Arc<Mesh>, model: Mat4, material: Material) {
-        self.items.push(Item::ThreeD(ThreeDItem { mesh, model, material }));
+        self.items.push(Item::ThreeD(ThreeDItem {
+            mesh,
+            model,
+            material,
+        }));
     }
 }
 
@@ -147,7 +170,11 @@ mod tests {
     fn scene_builds_items() {
         let mut s = Scene::new();
         s.fill_2d(Path::rect(0.0, 0.0, 10.0, 10.0), Color::RED);
-        s.draw_3d(Arc::new(Mesh::cube(1.0)), Mat4::IDENTITY, Material::default());
+        s.draw_3d(
+            Arc::new(Mesh::cube(1.0)),
+            Mat4::IDENTITY,
+            Material::default(),
+        );
         assert_eq!(s.items.len(), 2);
         s.clear();
         assert!(s.items.is_empty());

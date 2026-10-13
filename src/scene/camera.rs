@@ -1,7 +1,6 @@
-use glam::{Mat4, Vec3};
+use crate::math::{Mat4, Vec3};
 
-/// Right-handed perspective camera (OpenGL/Metal/Vulkan convention:
-/// +z points out of the screen, clip z in [-1, 1]).
+/// Right-handed perspective camera. Metal/Vulkan clip depth is [0, 1].
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub eye: Vec3,
@@ -38,7 +37,15 @@ impl Camera {
         near: f32,
         far: f32,
     ) -> Self {
-        Self { eye, target, up, fov_y_deg, aspect, near, far }
+        Self {
+            eye,
+            target,
+            up,
+            fov_y_deg,
+            aspect,
+            near,
+            far,
+        }
     }
 
     /// View matrix (world -> camera space).
@@ -47,26 +54,17 @@ impl Camera {
         Mat4::look_at_rh(self.eye, self.target, self.up)
     }
 
-    /// Perspective projection matrix (clip z in [-1, 1]).
+    /// Perspective projection matrix.
     #[must_use]
     pub fn projection(&self) -> Mat4 {
         let fov = self.fov_y_deg.to_radians().max(1e-4);
-        Mat4::perspective_rh_gl(fov, self.aspect.max(1e-4), self.near, self.far)
+        Mat4::perspective_rh(fov, self.aspect.max(1e-4), self.near, self.far)
     }
 
     /// `projection * view`.
     #[must_use]
     pub fn view_projection(&self) -> Mat4 {
         self.projection() * self.view()
-    }
-
-    /// Normal matrix for `view * model`: transposed inverse of the
-    /// upper-left 3x3 (glam Mat3, column-major).
-    #[must_use]
-    pub fn normal_matrix(&self, model: &Mat4) -> glam::Mat3 {
-        let m = self.view() * model;
-        let nm = glam::Mat3 { x_axis: m.x_axis.truncate(), y_axis: m.y_axis.truncate(), z_axis: m.z_axis.truncate() };
-        nm.inverse().transpose()
     }
 
     pub fn set_aspect(&mut self, aspect: f32) {
@@ -77,7 +75,7 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec4;
+    use crate::math::Vec4;
 
     #[test]
     fn target_projects_to_clip_origin() {
@@ -88,16 +86,7 @@ mod tests {
         assert!(ndc.x.abs() < 1e-4);
         assert!(ndc.y.abs() < 1e-4);
         // Eye at z=3 looking at origin: target is between near (0.1) and far (100),
-        // so NDC z is in (0, 1) for the GL [-1, 1] depth range.
+        // so NDC z is in (0, 1) for the Metal [0, 1] depth range.
         assert!((0.0..1.0).contains(&ndc.z));
-    }
-
-    #[test]
-    fn normal_matrix_is_orthonormal_for_rigid() {
-        let cam = Camera::default();
-        let model = Mat4::from_rotation_y(0.7);
-        let nm = cam.normal_matrix(&model);
-        // Column 0 should be unit length.
-        assert!((nm.x_axis.length() - 1.0).abs() < 1e-4);
     }
 }

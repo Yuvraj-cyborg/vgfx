@@ -1,4 +1,4 @@
-//! Vulkan backend for Linux / Windows (via `ash`).
+//! Vulkan backend for Linux / Windows (native implementation pending).
 //!
 //! Not implemented yet: this module only provides a compiling stub so the
 //! crate builds on non-Apple targets. `VulkanBackend::offscreen` and every
@@ -6,7 +6,7 @@
 //! backend lands (see `src/backend/metal.rs` for the reference design:
 //! frame submission, 2D/3D pipelines, readback for PNG export).
 
-use crate::backend::{Frame, Gpu};
+use crate::backend::common::{Frame, Gpu};
 use crate::error::{Error, Result};
 use crate::scene::Camera;
 
@@ -40,7 +40,9 @@ impl Gpu for VulkanBackend {
     }
 
     fn render(&mut self, _frame: &Frame, _camera: &Camera) -> Result<()> {
-        Err(Error::Backend("vulkan backend is not implemented yet".into()))
+        Err(Error::Backend(
+            "vulkan backend is not implemented yet".into(),
+        ))
     }
 
     fn readback(&mut self) -> Option<Vec<u8>> {

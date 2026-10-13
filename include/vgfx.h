@@ -10,8 +10,8 @@
  *
  * Linking:
  *  - Linux:    -lvgfx  (plus your Vulkan/loader deps when using Vulkan)
- *  - macOS:    -lvgfx -framework Metal -framework CoreGraphics
- *              -framework CoreFoundation -framework QuartzCore
+ *  - macOS:    -lvgfx -lobjc -framework Metal -framework Foundation
+ *              -framework QuartzCore -framework AppKit
  *  - Windows:  vgfx.lib (Vulkan backend)
  */
 #ifndef VGFX_H
@@ -26,6 +26,7 @@ extern "C" {
 
 typedef struct vgfx_renderer vgfx_renderer;
 typedef struct vgfx_mesh vgfx_mesh;
+typedef struct vgfx_prepared_mesh vgfx_prepared_mesh;
 
 /* ---- lifecycle ---------------------------------------------------------- */
 
@@ -95,6 +96,16 @@ void vgfx_mesh_destroy(vgfx_mesh *m);
 
 /* Draw a mesh with a model matrix and color. */
 void vgfx_draw_mesh(vgfx_renderer *r, vgfx_mesh *m, const float model[16], const float rgba[4]);
+
+/* Setup-time storage and resident meshes. All allocations belong to Rust.
+ * Capacity overflow is reported by vgfx_present; begin_frame clears the error.
+ * A prepared mesh may only be drawn by the renderer that prepared it.
+ * Renderer destruction releases GPU storage. Prepared-handle destruction
+ * releases its CPU reference; destroy it before destroying its renderer. */
+int vgfx_reserve_geometry(vgfx_renderer *r, uint32_t draws, uint32_t vertices, uint32_t indices);
+vgfx_prepared_mesh *vgfx_prepare_mesh(vgfx_renderer *r, vgfx_mesh *m);
+void vgfx_prepared_mesh_destroy(vgfx_prepared_mesh *m);
+void vgfx_draw_prepared_mesh(vgfx_renderer *r, vgfx_prepared_mesh *m, const float model[16], const float rgba[4]);
 
 /* ---- output -------------------------------------------------------------- */
 

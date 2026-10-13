@@ -1,75 +1,62 @@
 # vgfx
 
-Cross-language, cross-platform 2D/3D vector-graphics engine in Rust that talks
-**directly to the GPU**:
+Rust 2D/3D vector graphics with **zero third-party libraries**. Rust owns frame
+storage and GPU shared-buffer backing memory. Metal is accessed through local
+system bindings; macOS demos use native AppKit. Linux/Windows Vulkan is currently
+an explicit unimplemented backend.
 
-- **Apple (macOS/iOS)** → Metal — implemented
-- **Linux / Windows** → Vulkan (`ash`) — stub, in progress
-
-> All rendering runs on the GPU. Apple's NPU is an ML accelerator, not a
-> graphics device, and is not used.
-
-## Features
-
-- 2D: rects, rounded rects, circles, cubic-bezier paths — fill (even-odd,
-  holes) and stroke
-- 3D: indexed meshes, perspective camera, per-vertex colors, Lambert +
-  specular lighting, depth
-- Immediate-mode `Renderer` API (retained `Scene` under the hood)
-- Windowed (winit) and headless/offscreen rendering with PNG export
-- Plain C ABI (`include/vgfx.h`) — usable from C/C++, Python, Go, Zig, Swift…
-
-## Quick start
+The design aims for a flat execution profile: fixed primitive subdivision,
+explicit preparation, reserved frame capacity, retained mesh uploads, and no
+Rust heap growth during successful prepared frame submission. GPU duration still
+depends on geometry and rasterization. See [ARCHITECTURE.md](ARCHITECTURE.md) for
+the philosophy, allocation boundaries, limitations, and ownership rules.
 
 ```rust
+use std::sync::Arc;
 use vgfx::prelude::*;
 
-let mut r = Renderer::offscreen(1280, 720).unwrap();
+let mut r = Renderer::offscreen(1280, 720)?;
+r.reserve_geometry(4096, 65536, 262144)?;
+let cube = r.prepare_mesh(Arc::new(Mesh::cube(1.0)))?;
+// Repeat this block without Rust frame-loop allocation:
 r.begin_frame();
 r.set_background(Color::srgb(0.08, 0.09, 0.12, 1.0));
+r.draw_prepared_mesh(&cube, Mat4::IDENTITY, Material::default());
 r.fill_rect(40.0, 40.0, 200.0, 120.0, Color::srgb(0.2, 0.8, 0.6, 1.0));
 r.fill_circle(400.0, 200.0, 80.0, Color::srgb(0.9, 0.4, 0.2, 1.0));
-r.present().unwrap();
-r.save_png("out.png").unwrap();
+r.present()?;
+// Output is outside the frame loop:
+r.save_png("out.png")?;
+# Ok::<(), vgfx::Error>(())
 ```
 
-Bundled examples:
+General paths support even-odd fills, holes and strokes. Prepare them once with
+`Renderer::prepare_2d`, then record with `draw_prepared_2d`. Cubics use 32 fixed
+segments; circle/rounded-rectangle convenience draws use precomputed polygons.
+The local OBJ importer supports positions, normals, triangles and planar convex
+n-gons; triangulate concave faces before import. PNG export uses uncompressed
+DEFLATE for predictable work and produces larger files.
+
+Math types moved from the external math crate to `vgfx::math` (also exported by
+the prelude). Existing convenience mesh/path APIs remain for one-shot rendering;
+they can allocate during recording. Use prepared APIs in steady frame loops.
 
 ```sh
-make run-2d        # offscreen 2D scene → out.png
-make run-3d        # offscreen 3D scene → out.png
-make run-windowed  # interactive Metal window: spinning cube, bouncing sphere
+cargo test --all-targets --offline
+cargo clippy --all-targets --offline -- -D warnings
+cargo run --release --offline --example resident_probe # requires Metal GPU
+make run-2d run-3d run-model  # offscreen examples → out.png
+make run-windowed run-doom   # macOS interactive demos
+make ffi-c ffi-py           # plain C ABI / Python ctypes examples
+make check-all              # native + x86_64 Linux checks
 ```
 
-## C ABI
+Link `libvgfx.{a,so,dylib}` and include [include/vgfx.h](include/vgfx.h).
+Mesh/renderer/prepared handles allocate and free in Rust. C callers can reserve
+frame capacity and prepare resident meshes through the same API; capacity overflow
+is reported by `vgfx_present`. Do not free returned handles with C `free`.
 
-```sh
-make ffi-c     # examples/c_example/main.c, compiled against the cdylib
-make ffi-py    # examples/ffi_python/render.py, via ctypes
-```
-
-Link `libvgfx.{a,so,dylib}`, include `include/vgfx.h`. The full API surface is
-in `src/ffi.rs`.
-
-## Cross-compilation
-
-```sh
-make check-all             # cargo check: native + x86_64-linux
-make cross-linux-aarch64   # needs `cargo install cross` (Cross.toml included)
-make cross-linux-x86_64
-make cross-windows
-```
-
-CI (`.github/workflows/ci.yml`) builds and tests macOS/Linux/Windows on every
-push.
-
-## Layout
-
-- `src/geometry` — paths, bezier flattening, fill/stroke tessellation
-- `src/scene` — camera, meshes, materials
-- `src/backend` — `Gpu` trait, Metal + Vulkan implementations, `Renderer`
-- `src/ffi.rs` — C ABI; `include/vgfx.h`; `examples/` — one folder per demo
-
-## License
+Rust standard library and native OS frameworks are required; no Cargo dependencies,
+build helpers, image/model libraries, window libraries, or vendored crate code.
 
 MIT

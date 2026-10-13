@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// Errors produced by vgfx.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
     /// No usable GPU device was found (e.g. no Metal device, no Vulkan driver).
     NoGpuDevice(String),
@@ -31,12 +31,6 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io(e.to_string())
-    }
-}
-
-impl From<image::ImageError> for Error {
-    fn from(e: image::ImageError) -> Self {
         Error::Io(e.to_string())
     }
 }

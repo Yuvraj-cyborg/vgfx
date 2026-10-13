@@ -10,16 +10,3 @@ name = "vgfx"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-glam = "0.30"
-bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
-
-[target.'cfg(target_vendor = "apple")'.dependencies]
-metal = "0.29"
-core-graphics-types = "0.1"
-
-[target.'cfg(not(target_vendor = "apple"))'.dependencies]
-ash = "0.38"
-
-[dev-dependencies]
-winit = "0.30"

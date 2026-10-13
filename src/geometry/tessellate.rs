@@ -7,7 +7,7 @@
 
 use crate::geometry::affine::Affine;
 use crate::geometry::path::{Path, PathCmd};
-use glam::Vec2;
+use crate::math::Vec2;
 
 /// Default flattening tolerance (user units, e.g. pixels).
 pub const DEFAULT_TOLERANCE: f32 = 0.1;
@@ -62,30 +62,53 @@ fn signed_area(poly: &[Vec2]) -> f32 {
     a * 0.5
 }
 
-/// Flatten one cubic segment into `out` (adaptive de Casteljau).
-fn flatten_cubic(p0: Vec2, c1: Vec2, c2: Vec2, p1: Vec2, tol: f32, depth: u32, out: &mut Vec<Vec2>) {
-    let chord = p1 - p0;
-    let len = chord.length();
-    let flat = if len < 1e-9 {
-        c1.distance(p0) + c2.distance(p1)
-    } else {
-        let n = chord / len;
-        let d1 = (c1 - p0 - n * (c1 - p0).dot(n)).length();
-        let d2 = (c2 - p0 - n * (c2 - p0).dot(n)).length();
-        d1.max(d2)
-    };
-    if depth > 16 || flat <= tol {
-        out.push(p1);
-        return;
+/// Fixed subdivision: identical work per cubic regardless of curvature/scale.
+/// Tolerance is retained for source compatibility; quality is 32 segments/cubic.
+fn flatten_cubic(
+    p0: Vec2,
+    c1: Vec2,
+    c2: Vec2,
+    p1: Vec2,
+    _tol: f32,
+    _depth: u32,
+    out: &mut Vec<Vec2>,
+) {
+    const SEGMENTS: usize = 32;
+    out.reserve(SEGMENTS);
+    for i in 1..=SEGMENTS {
+        let t = i as f32 / SEGMENTS as f32;
+        let u = 1.0 - t;
+        out.push(
+            p0 * (u * u * u) + c1 * (3.0 * u * u * t) + c2 * (3.0 * u * t * t) + p1 * (t * t * t),
+        );
     }
-    let a01 = (p0 + c1) * 0.5;
-    let a12 = (c1 + c2) * 0.5;
-    let a23 = (c2 + p1) * 0.5;
-    let b01 = (a01 + a12) * 0.5;
-    let b12 = (a12 + a23) * 0.5;
-    let mid = (b01 + b12) * 0.5;
-    flatten_cubic(p0, a01, b01, mid, tol, depth + 1, out);
-    flatten_cubic(mid, b12, a23, p1, tol, depth + 1, out);
+}
+
+/// Finish one subpath: drop degenerate points, then store it if non-trivial.
+///
+/// Two cleanups happen here, both load-bearing for stroking:
+/// - consecutive duplicates would become zero-length segments, and
+///   `offset_loops` rejects the whole subpath on those (a stroked
+///   rounded rect would silently vanish);
+/// - a closed path whose last point re-visits the start (exact for
+///   `rounded_rect`, float-error sliver ~1e-5 for `circle`) would add a
+///   zero/sliver wrap segment, self-intersecting the offsets so holes
+///   fill in (a stroked circle rendered as a disc).
+fn finish_subpath(current: &mut Vec<Vec2>, closed: bool, subs: &mut Vec<Subpath>) {
+    current.dedup();
+    if closed {
+        while current.len() > 1 && current[current.len() - 1].distance_squared(current[0]) < 1e-8 {
+            current.pop();
+        }
+    }
+    if current.len() > 1 {
+        subs.push(Subpath {
+            points: std::mem::take(current),
+            closed,
+        });
+    } else {
+        current.clear();
+    }
 }
 
 /// Flatten a path into polyline subpaths.
@@ -98,11 +121,7 @@ pub fn flatten(path: &Path, tolerance: f32) -> Vec<Subpath> {
     for cmd in path.cmds() {
         match cmd {
             PathCmd::MoveTo(p) => {
-                if current.len() > 1 {
-                    subs.push(Subpath { points: std::mem::take(&mut current), closed });
-                } else {
-                    current.clear();
-                }
+                finish_subpath(&mut current, closed, &mut subs);
                 closed = false;
                 cur = *p;
                 current.push(*p);
@@ -118,9 +137,7 @@ pub fn flatten(path: &Path, tolerance: f32) -> Vec<Subpath> {
             PathCmd::Close => closed = true,
         }
     }
-    if current.len() > 1 {
-        subs.push(Subpath { points: current, closed });
-    }
+    finish_subpath(&mut current, closed, &mut subs);
     subs
 }
 
@@ -166,8 +183,12 @@ fn segments_properly_intersect(p1: Vec2, p2: Vec2, p3: Vec2, p4: Vec2) -> bool {
 /// `hole` such that the segment crosses no edges of either.
 fn find_bridge(outer: &[Vec2], hole: &[Vec2]) -> Option<(usize, usize)> {
     // Heuristic start: rightmost hole vertex / rightmost outer vertex.
-    let hi = (0..hole.len()).max_by(|&a, &b| hole[a].x.partial_cmp(&hole[b].x).unwrap()).unwrap();
-    let oi = (0..outer.len()).max_by(|&a, &b| outer[a].x.partial_cmp(&outer[b].x).unwrap()).unwrap();
+    let hi = (0..hole.len())
+        .max_by(|&a, &b| hole[a].x.total_cmp(&hole[b].x))
+        .unwrap();
+    let oi = (0..outer.len())
+        .max_by(|&a, &b| outer[a].x.total_cmp(&outer[b].x))
+        .unwrap();
     for dh in 0..hole.len() {
         for do_ in 0..outer.len() {
             let h = (hi + dh) % hole.len();
@@ -208,25 +229,26 @@ fn find_bridge(outer: &[Vec2], hole: &[Vec2]) -> Option<(usize, usize)> {
     None
 }
 
-/// Splice `hole` into `poly` (both CCW) using the bridge technique.
+/// Splice `hole` into `poly` (both CCW) using the bridge technique:
+/// walk the outer loop from the bridge vertex, cross over to the hole,
+/// walk the hole backwards (to keep one consistent winding), cross back.
 fn merge_hole(poly: &mut Vec<Vec2>, hole: &[Vec2]) -> bool {
     let Some((oi, hi)) = find_bridge(poly, hole) else {
         return false;
     };
     let n = poly.len();
     let m = hole.len();
-    // Outer loop starting at o: poly[oi..] ++ poly[..oi]
-    let mut merged: Vec<Vec2> = Vec::with_capacity(n + m + 1);
+    let mut merged: Vec<Vec2> = Vec::with_capacity(n + m + 2);
+    // Outer loop starting at the bridge vertex o (visited twice: once
+    // before crossing to the hole, once implicitly when closing back).
     merged.extend_from_slice(&poly[oi..]);
     merged.extend_from_slice(&poly[..oi]);
-    // Then re-visit o (bridge over) and walk the hole backwards, ending at h
-    // again so the implicit closing edge is the bridge back (o).
     merged.push(poly[oi]);
-    let rev: Vec<Vec2> = hole[0..=hi].iter().rev().chain(hole[hi + 1..].iter().rev()).cloned().collect();
-    debug_assert_eq!(rev[0], hole[hi]);
-    merged.extend(rev);
+    // Hole walked backwards starting and ending at h.
+    for k in 0..m {
+        merged.push(hole[(hi + m - k) % m]);
+    }
     merged.push(hole[hi]);
-    let _ = m;
     *poly = merged;
     true
 }
@@ -249,7 +271,7 @@ fn triangulate_polygon(pts: &[Vec2]) -> Vec<u32> {
     }
     idx = deduped;
     if idx.len() > 3 {
-        let m = idx.len() as usize;
+        let m = idx.len();
         let mut out: Vec<u32> = Vec::with_capacity(m);
         for k in 0..m {
             let a = pts[idx[(k + m - 1) % m] as usize];
@@ -280,17 +302,26 @@ fn triangulate_polygon(pts: &[Vec2]) -> Vec<u32> {
             if convex {
                 let mut blocked = false;
                 for &v in &idx {
-                    let vi = v as usize;
-                    if vi == a || vi == b || vi == c {
+                    // Compare by position, not index: hole-bridging inserts
+                    // the slit endpoints twice (same point, two indices), and
+                    // a slit twin sitting on the ear's own corner must not
+                    // veto it — otherwise no slit ear is ever cut, the
+                    // clipper stalls, and the fan fallback covers the hole.
+                    let pv = pts[v as usize];
+                    if pv == pa || pv == pb || pv == pc {
                         continue;
                     }
-                    if point_in_triangle(pts[vi], pa, pb, pc) {
+                    if point_in_triangle(pv, pa, pb, pc) {
                         blocked = true;
                         break;
                     }
                 }
                 if !blocked {
-                    indices.extend_from_slice(&[idx[(i + len - 1) % len], idx[i], idx[(i + 1) % len]]);
+                    indices.extend_from_slice(&[
+                        idx[(i + len - 1) % len],
+                        idx[i],
+                        idx[(i + 1) % len],
+                    ]);
                     idx.remove(i);
                     ear_found = true;
                     break;
@@ -384,7 +415,12 @@ pub fn fill(path: &Path, transform: &Affine, tolerance: f32) -> Triangles {
     let subs = flatten(path, tolerance);
     let polys: Vec<Vec<Vec2>> = subs
         .into_iter()
-        .map(|s| s.points.iter().map(|p| transform.transform_point(*p)).collect())
+        .map(|s| {
+            s.points
+                .iter()
+                .map(|p| transform.transform_point(*p))
+                .collect()
+        })
         .collect();
     fill_polys(polys)
 }
@@ -427,11 +463,16 @@ fn offset_loops(pts: &[Vec2], closed: bool, width: f32, miter_limit: f32) -> Opt
     // Miter/bevel points per vertex.
     let mut left: Vec<Vec2> = Vec::with_capacity(n);
     let mut right: Vec<Vec2> = Vec::with_capacity(n);
-    for i in 0..n {
-        let p = pts[i];
-        // Incoming/outgoing segment indices for vertex i.
-        let in_seg = if closed { (i + n - 1) % n } else { i.saturating_sub(1) };
-        let out_seg = if closed { i } else { i.min(n - 2) };
+    for (i, &p) in pts.iter().enumerate() {
+        // Incoming/outgoing segment indices for vertex i. Endpoints of an
+        // open path reuse their single adjacent segment (butt caps, handled
+        // below); interior vertices join segments i-1 and i.
+        let in_seg = if closed {
+            (i + n - 1) % n
+        } else {
+            i.saturating_sub(1)
+        };
+        let out_seg = if closed { i % segs } else { i.min(n - 2) };
         let dp = dirs[in_seg];
         let dn = dirs[out_seg];
         let np = Vec2::new(-dp.y, dp.x);
@@ -455,25 +496,19 @@ fn offset_loops(pts: &[Vec2], closed: bool, width: f32, miter_limit: f32) -> Opt
 
         // Miter joins on both offset lines, clamped by miter limit
         // (CSS `stroke-linejoin: miter` semantics).
-        let mut mitered = false;
-        if let Some(m) = line_intersect(lp, dp, ln, dn) {
-            if m.distance(p) <= hw * miter_limit {
-                left.push(m);
-                mitered = true;
-            }
-        }
-        if !mitered {
+        if let Some(m) = line_intersect(lp, dp, ln, dn)
+            && m.distance(p) <= hw * miter_limit
+        {
+            left.push(m);
+        } else {
             left.push(lp);
             left.push(ln);
         }
-        let mut mitered_r = false;
-        if let Some(m) = line_intersect(rp, dp, rn, dn) {
-            if m.distance(p) <= hw * miter_limit {
-                right.push(m);
-                mitered_r = true;
-            }
-        }
-        if !mitered_r {
+        if let Some(m) = line_intersect(rp, dp, rn, dn)
+            && m.distance(p) <= hw * miter_limit
+        {
+            right.push(m);
+        } else {
             right.push(rp);
             right.push(rn);
         }
@@ -492,7 +527,11 @@ pub fn stroke(path: &Path, transform: &Affine, width: f32, tolerance: f32) -> Tr
     let mut triangles = Triangles::default();
     let mut voff = 0u32;
     for sub in subs {
-        let pts: Vec<Vec2> = sub.points.iter().map(|p| transform.transform_point(*p)).collect();
+        let pts: Vec<Vec2> = sub
+            .points
+            .iter()
+            .map(|p| transform.transform_point(*p))
+            .collect();
         let Some(ol) = offset_loops(&pts, sub.closed, w, 4.0) else {
             continue;
         };
@@ -566,6 +605,13 @@ mod tests {
         let t = fill(&p, &Affine::IDENTITY, DEFAULT_TOLERANCE);
         let want = PI * (20.0 * 20.0 - 8.0 * 8.0);
         area_close(t.area().abs(), want, want * 0.02);
+        // Area alone can't catch a covered hole (overlaps cancel), so check
+        // coverage too.
+        assert_eq!(
+            coverage(&t, Vec2::new(50.37, 51.13)),
+            0,
+            "hole must stay open"
+        );
     }
 
     #[test]
@@ -575,6 +621,12 @@ mod tests {
         append(&mut p, &Path::rect(5.0, 5.0, 10.0, 10.0));
         let t = fill(&p, &Affine::IDENTITY, DEFAULT_TOLERANCE);
         area_close(t.area().abs(), 400.0 - 100.0, 0.01);
+        assert_eq!(
+            coverage(&t, Vec2::new(10.37, 7.13)),
+            0,
+            "hole must stay open"
+        );
+        assert_eq!(coverage(&t, Vec2::new(2.37, 3.13)), 1, "frame covered once");
     }
 
     #[test]
@@ -595,15 +647,71 @@ mod tests {
         area_close(t.area().abs(), 80.0, 0.5);
     }
 
+    /// Triangles covering `pt` (winding-independent count).
+    fn coverage(t: &Triangles, pt: Vec2) -> usize {
+        let mut n = 0;
+        for tri in t.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                t.vertices[tri[0] as usize],
+                t.vertices[tri[1] as usize],
+                t.vertices[tri[2] as usize],
+            );
+            if point_in_triangle(pt, a, b, c) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn stroke_circle_is_a_ring() {
+        // Regression (two chained bugs): the flattened circle used to end
+        // where it began, and that closing duplicate self-intersected the
+        // stroke offsets — and independently, slit-twin vertices vetoed
+        // every hole ear, so the fan fallback covered the hole. A stroked
+        // circle rendered as a disc (or vanished entirely, before that).
+        let p = Path::circle(0.0, 0.0, 90.0, 48);
+        let t = stroke(&p, &Affine::IDENTITY, 8.0, DEFAULT_TOLERANCE);
+        area_close(t.area().abs(), 2.0 * PI * 90.0 * 8.0, 30.0);
+        // Off-edge samples (boundary counts as covered, so avoid edges).
+        assert_eq!(
+            coverage(&t, Vec2::new(0.37, 1.13)),
+            0,
+            "hole must stay open"
+        );
+        assert_eq!(coverage(&t, Vec2::new(90.0, 1.7)), 1, "band covered once");
+        assert_eq!(coverage(&t, Vec2::new(200.0, 3.1)), 0);
+    }
+
+    #[test]
+    fn stroke_rounded_rect_is_visible() {
+        // Regression: rounded_rect ends exactly where it began, and that
+        // exact duplicate made offset_loops reject the path, so the stroke
+        // silently vanished (area 0).
+        let p = crate::geometry::rounded_rect(0.0, 0.0, 10.0, 10.0, 2.0);
+        let t = stroke(&p, &Affine::IDENTITY, 2.0, DEFAULT_TOLERANCE);
+        assert!(!t.is_empty(), "stroke must produce geometry");
+        // Straights 4x(10-2*2)=24 plus corner arcs 2*pi*2: perimeter ~36.6.
+        area_close(t.area().abs(), 36.57 * 2.0, 2.0);
+    }
+
     #[test]
     fn flatten_cubic_midpoint() {
         let mut p = Path::new();
         p.move_to(Vec2::new(0.0, 0.0));
-        p.cubic_to(Vec2::new(3.0, 10.0), Vec2::new(7.0, 10.0), Vec2::new(10.0, 0.0));
+        p.cubic_to(
+            Vec2::new(3.0, 10.0),
+            Vec2::new(7.0, 10.0),
+            Vec2::new(10.0, 0.0),
+        );
         let subs = flatten(&p, 0.01);
         let pts = &subs[0].points;
         // Exact bezier midpoint at t=0.5: (5, 7.5).
-        let best = pts.iter().min_by(|a, b| a.distance_squared(Vec2::new(5.0, 7.5)).partial_cmp(&b.distance_squared(Vec2::new(5.0, 7.5))).unwrap());
+        let best = pts.iter().min_by(|a, b| {
+            a.distance_squared(Vec2::new(5.0, 7.5))
+                .partial_cmp(&b.distance_squared(Vec2::new(5.0, 7.5)))
+                .unwrap()
+        });
         assert!(best.unwrap().distance(Vec2::new(5.0, 7.5)) < 0.05);
     }
 

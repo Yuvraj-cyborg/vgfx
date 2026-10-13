@@ -12,11 +12,8 @@ or via the Makefile:
 import ctypes
 import math
 import os
-import sys
 from ctypes import (
     POINTER,
-    Structure,
-    byref,
     c_char_p,
     c_float,
     c_uint32,
@@ -32,10 +29,7 @@ def _lib_path():
         "libvgfx.so",
         "vgfx.dll",
     ):
-        if sys.platform == "win32":
-            cand = os.path.join(ROOT, "target", "debug", dylib)
-        else:
-            cand = os.path.join(ROOT, "target", "debug", dylib)
+        cand = os.path.join(ROOT, "target", "debug", dylib)
         if os.path.exists(cand):
             return cand
     raise SystemExit(
@@ -75,9 +69,9 @@ class Vgfx:
         self.lib.vgfx_draw_cube.argtypes = [c_void_p, POINTER(c_float), POINTER(c_float)]
         self.lib.vgfx_draw_sphere.argtypes = [c_void_p, c_float, c_uint32, c_uint32, POINTER(c_float), POINTER(c_float)]
         # output
-        self.lib.vgfx_present.restype = c_int = ctypes.c_int
+        self.lib.vgfx_present.restype = ctypes.c_int
         self.lib.vgfx_present.argtypes = [c_void_p]
-        self.lib.vgfx_save_png.restype = c_int
+        self.lib.vgfx_save_png.restype = ctypes.c_int
         self.lib.vgfx_save_png.argtypes = [c_void_p, c_char_p]
 
     def check(self, what):

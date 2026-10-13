@@ -54,6 +54,7 @@ pub mod geometry;
 pub mod math;
 mod png;
 pub mod scene;
+pub mod studio;
 pub mod text;
 #[cfg(target_os = "macos")]
 pub mod window;

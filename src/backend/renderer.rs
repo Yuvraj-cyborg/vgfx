@@ -687,7 +687,7 @@ mod allocation_tests {
     fn circle_stroke_has_no_center_coverage() {
         let mut r = Renderer::new_boxed(Box::new(Mock));
         r.stroke_circle(0., 0., 10., 2., Color::WHITE);
-        for tri in r.frame.indices.chunks_exact(3) {
+        for tri in r.frame.indices.as_chunks::<3>().0 {
             let p: Vec<_> = tri
                 .iter()
                 .map(|&i| {

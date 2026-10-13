@@ -29,7 +29,7 @@ impl Triangles {
     #[must_use]
     pub fn area(&self) -> f32 {
         let mut a = 0.0f32;
-        for t in self.indices.chunks_exact(3) {
+        for t in self.indices.as_chunks::<3>().0 {
             let p0 = self.vertices[t[0] as usize];
             let p1 = self.vertices[t[1] as usize];
             let p2 = self.vertices[t[2] as usize];
@@ -650,7 +650,7 @@ mod tests {
     /// Triangles covering `pt` (winding-independent count).
     fn coverage(t: &Triangles, pt: Vec2) -> usize {
         let mut n = 0;
-        for tri in t.indices.chunks_exact(3) {
+        for tri in t.indices.as_chunks::<3>().0 {
             let (a, b, c) = (
                 t.vertices[tri[0] as usize],
                 t.vertices[tri[1] as usize],

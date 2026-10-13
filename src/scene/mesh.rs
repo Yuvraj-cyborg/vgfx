@@ -312,7 +312,7 @@ impl Mesh {
             return Err(Error::Io("obj file has no faces".into()));
         }
         // Missing normals use area-weighted smoothing across position indices.
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             let a = Vec3::from(vertices[tri[0] as usize].pos);
             let n = (Vec3::from(vertices[tri[1] as usize].pos) - a)
                 .cross(Vec3::from(vertices[tri[2] as usize].pos) - a);

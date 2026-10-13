@@ -275,7 +275,7 @@ impl MetalBackend {
             msg!(a,"setBlendingEnabled:"=>(),true=>bool);
             msg!(a,"setSourceRGBBlendFactor:"=>(),4=>usize);
             msg!(a,"setDestinationRGBBlendFactor:"=>(),5=>usize);
-            msg!(a,"setSourceAlphaBlendFactor:"=>(),4=>usize);
+            msg!(a,"setSourceAlphaBlendFactor:"=>(),1=>usize);
             msg!(a,"setDestinationAlphaBlendFactor:"=>(),5=>usize);
         }
         let mut error: Id = std::ptr::null_mut();
@@ -585,7 +585,7 @@ impl Gpu for MetalBackend {
         Self::complete(cmd.id()).ok()?;
         let mut rgba =
             unsafe { std::slice::from_raw_parts(self.readback.bytes.as_ptr(), size) }.to_vec();
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         Some(rgba)

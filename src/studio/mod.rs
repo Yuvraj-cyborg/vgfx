@@ -14,6 +14,7 @@
     clippy::too_many_arguments
 )]
 
+pub mod forms;
 pub mod math;
 pub mod render;
 pub mod rig;

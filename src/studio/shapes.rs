@@ -65,7 +65,8 @@ fn fan(m: &mut Mesh, ring: &[V3], n: V3) {
         if ring[i] == ring[j] {
             continue;
         }
-        m.idx.extend_from_slice(&[base, base + 1 + i as u32, base + 1 + j as u32]);
+        m.idx
+            .extend_from_slice(&[base, base + 1 + i as u32, base + 1 + j as u32]);
     }
 }
 
@@ -79,7 +80,8 @@ fn quad(m: &mut Mesh, q: [(V3, V3); 4]) {
     }
     for (a, b, c) in [(0usize, 1usize, 2usize), (0, 2, 3)] {
         if q[a].0 != q[b].0 && q[b].0 != q[c].0 && q[c].0 != q[a].0 {
-            m.idx.extend_from_slice(&[base + a as u32, base + b as u32, base + c as u32]);
+            m.idx
+                .extend_from_slice(&[base + a as u32, base + b as u32, base + c as u32]);
         }
     }
 }
@@ -345,10 +347,24 @@ pub fn extrude_polys(contours: &[Vec<[f32; 2]>], z0: f32, z1: f32) -> Mesh {
 /// line, so the solid has no cracks. Over `rim` at each end the walls'
 /// normals turn halfway to the face, so light catches the edges as it would
 /// a small bevel; 0 leaves them sharp.
-pub fn extrude_outlines(contours: &[Vec<[f32; 2]>], z0: f32, z1: f32, even_odd: bool, rim: f32) -> Mesh {
+pub fn extrude_outlines(
+    contours: &[Vec<[f32; 2]>],
+    z0: f32,
+    z1: f32,
+    even_odd: bool,
+    rim: f32,
+) -> Mesh {
     let (z0, z1) = if z0 < z1 { (z0, z1) } else { (z1, z0) };
-    let rim = if rim > 0.0 { rim.min((z1 - z0) * 0.45) } else { 0.0 };
-    let outlines: Vec<Vec<[f32; 2]>> = contours.iter().map(|c| clean_outline(c)).filter(|c| c.len() >= 3).collect();
+    let rim = if rim > 0.0 {
+        rim.min((z1 - z0) * 0.45)
+    } else {
+        0.0
+    };
+    let outlines: Vec<Vec<[f32; 2]>> = contours
+        .iter()
+        .map(|c| clean_outline(c))
+        .filter(|c| c.len() >= 3)
+        .collect();
     let mut m = Mesh::default();
     // Outlines whose boxes do not touch are cut on their own, so one letter's
     // corners do not cut the bands of the next.
@@ -378,9 +394,15 @@ fn islands(outlines: &[Vec<[f32; 2]>]) -> Vec<Vec<usize>> {
     let boxes: Vec<[f32; 4]> = outlines
         .iter()
         .map(|c| {
-            c.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
-                [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]
-            })
+            c.iter()
+                .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
+                    [
+                        b[0].min(p[0]),
+                        b[1].min(p[1]),
+                        b[2].max(p[0]),
+                        b[3].max(p[1]),
+                    ]
+                })
         })
         .collect();
     let mut group: Vec<usize> = (0..outlines.len()).collect();
@@ -455,7 +477,15 @@ struct Span {
     right: usize,
 }
 
-fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0: f32, z1: f32, even_odd: bool, rim: f32) {
+fn extrude_island(
+    m: &mut Mesh,
+    outlines: &[Vec<[f32; 2]>],
+    island: &[usize],
+    z0: f32,
+    z1: f32,
+    even_odd: bool,
+    rim: f32,
+) {
     // Corners whose two edges turn by less than this share a normal, so a
     // curve reads as a curve and a corner stays a corner.
     const SMOOTH: f32 = 0.82;
@@ -474,12 +504,36 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
             }
             let here = side(k);
             let (before, after) = (side(k + n - 1), side(k + 1));
-            let at_a = if here.dot(before) > SMOOTH { (here + before).norm() } else { here };
-            let at_b = if here.dot(after) > SMOOTH { (here + after).norm() } else { here };
-            edges.push(if a[1] < b[1] {
-                Edge { x0: a[0], y0: a[1], x1: b[0], y1: b[1], w: 1, n0: at_a, n1: at_b }
+            let at_a = if here.dot(before) > SMOOTH {
+                (here + before).norm()
             } else {
-                Edge { x0: b[0], y0: b[1], x1: a[0], y1: a[1], w: -1, n0: at_b, n1: at_a }
+                here
+            };
+            let at_b = if here.dot(after) > SMOOTH {
+                (here + after).norm()
+            } else {
+                here
+            };
+            edges.push(if a[1] < b[1] {
+                Edge {
+                    x0: a[0],
+                    y0: a[1],
+                    x1: b[0],
+                    y1: b[1],
+                    w: 1,
+                    n0: at_a,
+                    n1: at_b,
+                }
+            } else {
+                Edge {
+                    x0: b[0],
+                    y0: b[1],
+                    x1: a[0],
+                    y1: a[1],
+                    w: -1,
+                    n0: at_b,
+                    n1: at_a,
+                }
             });
         }
     }
@@ -538,7 +592,10 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
             w += edges[j].w;
             match (was, solid(w)) {
                 (false, true) => start = j,
-                (true, false) => runs.push(Span { left: start, right: j }),
+                (true, false) => runs.push(Span {
+                    left: start,
+                    right: j,
+                }),
                 _ => {}
             }
         }
@@ -548,7 +605,10 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
     // Where the runs of one band meet a band line, from below or above.
     let ends = |b: usize, top: bool| -> Vec<[f32; 2]> {
         let y = if top { ys[b + 1] } else { ys[b] };
-        bands[b].iter().map(|s| [edges[s.left].x(y), edges[s.right].x(y)]).collect()
+        bands[b]
+            .iter()
+            .map(|s| [edges[s.left].x(y), edges[s.right].x(y)])
+            .collect()
     };
     // Every x on band line `l` where some run starts or ends, from either side.
     let cuts = |l: usize| -> Vec<f32> {
@@ -564,7 +624,11 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
         xs
     };
 
-    let zs: Vec<f32> = if rim > 0.0 { vec![z0, z0 + rim, z1 - rim, z1] } else { vec![z0, z1] };
+    let zs: Vec<f32> = if rim > 0.0 {
+        vec![z0, z0 + rim, z1 - rim, z1]
+    } else {
+        vec![z0, z1]
+    };
     let up = v3(0.0, 0.0, 1.0);
     // A wall's normal at height z: turned halfway to the face at each end.
     let turn = |n: V3, z: f32| -> V3 {
@@ -604,10 +668,21 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
             let (la, lb, ra, rb) = (l.x(ya), l.x(yb), r.x(ya), r.x(yb));
             // The faces, with every cut on their two level sides as a corner.
             let mut ring: Vec<[f32; 2]> = vec![[la, ya]];
-            ring.extend(line_cuts[b].iter().filter(|&&x| x > la && x < ra).map(|&x| [x, ya]));
+            ring.extend(
+                line_cuts[b]
+                    .iter()
+                    .filter(|&&x| x > la && x < ra)
+                    .map(|&x| [x, ya]),
+            );
             ring.push([ra, ya]);
             ring.push([rb, yb]);
-            ring.extend(line_cuts[b + 1].iter().rev().filter(|&&x| x > lb && x < rb).map(|&x| [x, yb]));
+            ring.extend(
+                line_cuts[b + 1]
+                    .iter()
+                    .rev()
+                    .filter(|&&x| x > lb && x < rb)
+                    .map(|&x| [x, yb]),
+            );
             ring.push([lb, yb]);
             // The ring runs counter-clockwise seen from above.
             let top: Vec<V3> = ring.iter().map(|p| v3(p[0], p[1], z1)).collect();
@@ -618,13 +693,23 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
             // smoothed normal points is settled on the whole edge, not on
             // this piece of it, which may be a sliver.
             let out = |e: &Edge, left: bool, y: f32| {
-                let g = if left { v3(-(e.y1 - e.y0), e.x1 - e.x0, 0.0) } else { v3(e.y1 - e.y0, -(e.x1 - e.x0), 0.0) };
+                let g = if left {
+                    v3(-(e.y1 - e.y0), e.x1 - e.x0, 0.0)
+                } else {
+                    v3(e.y1 - e.y0, -(e.x1 - e.x0), 0.0)
+                };
                 let n = e.normal(y);
                 if n.dot(g) < 0.0 { -n } else { n }
             };
             // Solid on the right of a walk up the left end, and of a walk down the right end.
             wall(m, [la, ya], [lb, yb], out(&l, true, ya), out(&l, true, yb));
-            wall(m, [rb, yb], [ra, ya], out(&r, false, yb), out(&r, false, ya));
+            wall(
+                m,
+                [rb, yb],
+                [ra, ya],
+                out(&r, false, yb),
+                out(&r, false, ya),
+            );
         }
     }
 
@@ -632,7 +717,11 @@ fn extrude_island(m: &mut Mesh, outlines: &[Vec<[f32; 2]>], island: &[usize], z0
     for l in 0..ys.len() {
         let y = ys[l];
         let below: Vec<[f32; 2]> = if l > 0 { ends(l - 1, true) } else { Vec::new() };
-        let above: Vec<[f32; 2]> = if l + 1 < ys.len() { ends(l, false) } else { Vec::new() };
+        let above: Vec<[f32; 2]> = if l + 1 < ys.len() {
+            ends(l, false)
+        } else {
+            Vec::new()
+        };
         let inside = |runs: &[[f32; 2]], x: f32| runs.iter().any(|r| x > r[0] && x < r[1]);
         let xs = &line_cuts[l];
         for k in 0..xs.len().saturating_sub(1) {
@@ -935,24 +1024,41 @@ mod tests {
         let mut count: HashMap<_, i32> = HashMap::new();
         for t in m.idx.as_chunks::<3>().0 {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *count.entry((key(m.pos[a as usize]), key(m.pos[b as usize]))).or_default() += 1;
+                *count
+                    .entry((key(m.pos[a as usize]), key(m.pos[b as usize])))
+                    .or_default() += 1;
             }
         }
-        count.iter().all(|(&(a, b), &n)| count.get(&(b, a)).copied().unwrap_or(0) == n)
+        count
+            .iter()
+            .all(|(&(a, b), &n)| count.get(&(b, a)).copied().unwrap_or(0) == n)
     }
 
     fn volume(m: &Mesh) -> f32 {
-        m.idx.as_chunks::<3>().0.iter().map(|t| {
-            let (a, b, c) = (m.pos[t[0] as usize], m.pos[t[1] as usize], m.pos[t[2] as usize]);
-            a.dot(b.cross(c)) / 6.0
-        }).sum()
+        m.idx
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (
+                    m.pos[t[0] as usize],
+                    m.pos[t[1] as usize],
+                    m.pos[t[2] as usize],
+                );
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum()
     }
 
     /// Each triangle faces the way its corners' normals say. A sliver one
     /// rounding step thick has no direction of its own, so it is not asked.
     fn facing(m: &Mesh) -> bool {
         m.idx.as_chunks::<3>().0.iter().all(|t| {
-            let (a, b, c) = (m.pos[t[0] as usize], m.pos[t[1] as usize], m.pos[t[2] as usize]);
+            let (a, b, c) = (
+                m.pos[t[0] as usize],
+                m.pos[t[1] as usize],
+                m.pos[t[2] as usize],
+            );
             let g = (b - a).cross(c - a);
             g.len() < 1e-6 || t.iter().all(|&i| g.dot(m.nrm[i as usize]) > 0.0)
         })
@@ -967,10 +1073,12 @@ mod tests {
     }
 
     fn ring(r: f32, n: usize, ccw: bool) -> Vec<[f32; 2]> {
-        let mut o: Vec<[f32; 2]> = (0..n).map(|i| {
-            let a = TAU * i as f32 / n as f32;
-            [r * cos(a), r * sin(a)]
-        }).collect();
+        let mut o: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let a = TAU * i as f32 / n as f32;
+                [r * cos(a), r * sin(a)]
+            })
+            .collect();
         if !ccw {
             o.reverse();
         }
@@ -983,17 +1091,37 @@ mod tests {
             assert!(closed(&m), "cracks or faces turned inside out (rim {rim})");
             assert!(facing(&m), "a face turned against its normals (rim {rim})");
             let v = volume(&m);
-            assert!((v - area * 0.5).abs() < 1e-3 * area.max(1.0), "volume {v}, expected {} (rim {rim})", area * 0.5);
+            assert!(
+                (v - area * 0.5).abs() < 1e-3 * area.max(1.0),
+                "volume {v}, expected {} (rim {rim})",
+                area * 0.5
+            );
         }
     }
 
     #[test]
     fn a_hole_is_a_hole_whichever_way_it_winds() {
-        solid(&[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, false)], false, 12.0);
-        solid(&[square(0.0, 0.0, 4.0, false), square(1.0, 1.0, 2.0, true)], false, 12.0);
-        solid(&[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, true)], true, 12.0);
+        solid(
+            &[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, false)],
+            false,
+            12.0,
+        );
+        solid(
+            &[square(0.0, 0.0, 4.0, false), square(1.0, 1.0, 2.0, true)],
+            false,
+            12.0,
+        );
+        solid(
+            &[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, true)],
+            true,
+            12.0,
+        );
         // Wound the same way under the non-zero rule, the inner square is solid.
-        solid(&[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, true)], false, 16.0);
+        solid(
+            &[square(0.0, 0.0, 4.0, true), square(1.0, 1.0, 2.0, true)],
+            false,
+            16.0,
+        );
     }
 
     #[test]
@@ -1005,14 +1133,28 @@ mod tests {
 
     #[test]
     fn an_outline_that_crosses_itself_is_filled_both_sides() {
-        solid(&[vec![[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]]], false, 2.0);
+        solid(
+            &[vec![[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]]],
+            false,
+            2.0,
+        );
     }
 
     #[test]
     fn an_e_with_its_level_bars_is_whole() {
         let e = vec![
-            [0.0, 0.0], [3.0, 0.0], [3.0, 1.0], [1.0, 1.0], [1.0, 2.0], [2.0, 2.0],
-            [2.0, 3.0], [1.0, 3.0], [1.0, 4.0], [3.0, 4.0], [3.0, 5.0], [0.0, 5.0],
+            [0.0, 0.0],
+            [3.0, 0.0],
+            [3.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 2.0],
+            [2.0, 3.0],
+            [1.0, 3.0],
+            [1.0, 4.0],
+            [3.0, 4.0],
+            [3.0, 5.0],
+            [0.0, 5.0],
         ];
         solid(&[e.clone()], false, 10.0);
         let mut back = e;
@@ -1024,22 +1166,42 @@ mod tests {
     fn an_o_faces_into_its_hole() {
         let (outer, inner) = (ring(1.0, 48, true), ring(0.6, 48, false));
         let area = |o: &[[f32; 2]]| area2(o).abs() * 0.5;
-        solid(&[outer.clone(), inner.clone()], false, area(&outer) - area(&inner));
+        solid(
+            &[outer.clone(), inner.clone()],
+            false,
+            area(&outer) - area(&inner),
+        );
         // The wall nearest the middle faces the middle.
         let m = extrude_outlines(&[outer, inner], -0.25, 0.25, false, 0.0);
-        let near = (0..m.pos.len()).filter(|&i| m.nrm[i].z == 0.0).min_by(|&i, &j| {
-            let (a, b) = (m.pos[i], m.pos[j]);
-            (a.x * a.x + a.y * a.y).total_cmp(&(b.x * b.x + b.y * b.y))
-        }).unwrap();
+        let near = (0..m.pos.len())
+            .filter(|&i| m.nrm[i].z == 0.0)
+            .min_by(|&i, &j| {
+                let (a, b) = (m.pos[i], m.pos[j]);
+                (a.x * a.x + a.y * a.y).total_cmp(&(b.x * b.x + b.y * b.y))
+            })
+            .unwrap();
         let (p, n) = (m.pos[near], m.nrm[near]);
-        assert!(p.x * n.x + p.y * n.y < 0.0, "the inside of the O faces outwards");
+        assert!(
+            p.x * n.x + p.y * n.y < 0.0,
+            "the inside of the O faces outwards"
+        );
     }
 
     #[test]
     fn letters_apart_are_cut_apart() {
-        let m = extrude_outlines(&[square(0.0, 0.0, 1.0, true), square(5.0, 0.3, 1.0, true)], 0.0, 0.2, false, 0.0);
+        let m = extrude_outlines(
+            &[square(0.0, 0.0, 1.0, true), square(5.0, 0.3, 1.0, true)],
+            0.0,
+            0.2,
+            false,
+            0.0,
+        );
         assert!(closed(&m));
         // Two cubes need no more than two caps of two triangles and four walls each.
-        assert!(m.idx.len() / 3 <= 2 * (2 * 4 + 4 * 2), "{} triangles", m.idx.len() / 3);
+        assert!(
+            m.idx.len() / 3 <= 2 * (2 * 4 + 4 * 2),
+            "{} triangles",
+            m.idx.len() / 3
+        );
     }
 }

@@ -1,11 +1,10 @@
 //! Declarative 3D stage that can hold any custom rig, shapes, materials,
-//! camera orbit, and studio lamps, or a preset mechanical assembly.
+//! camera orbit, and studio lamps.
 
 use super::math::{M4, Quat, V3, cos, sin, v3};
 use super::rig::{Belt, DEG, Ease, Rig, Track, Xf};
 use super::scene::{Camera, Floor, Frame, Instance, Light, Material, Mesh};
 use super::shapes::{add, ball, cyl, frame_y};
-use super::transformer::Transform;
 
 #[derive(Clone, Debug)]
 pub enum Place3D {
@@ -357,12 +356,6 @@ impl CustomStage {
 #[derive(Clone, Debug)]
 pub enum Stage {
     Custom(Box<CustomStage>),
-    Transformer {
-        transform: Box<Transform>,
-        start: f32,
-        rate: f32,
-        cam_override: Option<CamTracks>,
-    },
 }
 
 /// Reusable per-renderer evaluation buffers so `Stage::eval` never allocates
@@ -397,14 +390,12 @@ impl Stage {
     pub fn meshes(&self) -> &[Mesh] {
         match self {
             Stage::Custom(c) => &c.meshes,
-            Stage::Transformer { transform, .. } => &transform.meshes,
         }
     }
 
     pub fn materials(&self) -> &[Material] {
         match self {
             Stage::Custom(c) => &c.materials,
-            Stage::Transformer { transform, .. } => &transform.materials,
         }
     }
 
@@ -412,34 +403,6 @@ impl Stage {
         match self {
             Stage::Custom(c) => {
                 c.eval_into(t, &mut scratch.loc, &mut scratch.world, &mut scratch.frame)
-            }
-            Stage::Transformer {
-                transform,
-                start,
-                rate,
-                cam_override,
-            } => {
-                let tf_t = start + t.max(0.0) * rate;
-                transform.eval_into(
-                    tf_t,
-                    &mut scratch.loc,
-                    &mut scratch.world,
-                    &mut scratch.frame,
-                );
-                if let Some(cam) = cam_override {
-                    let az = cam.az.at(t) * DEG;
-                    let d = cam.dist.at(t).max(0.2);
-                    let target = v3(cam.aim_x.at(t), cam.aim_y.at(t), cam.aim_z.at(t));
-                    let eye = v3(target.x + d * sin(az), cam.y.at(t), target.z + d * cos(az));
-                    scratch.frame.camera = Camera {
-                        eye,
-                        target,
-                        up: V3::Y,
-                        tan_half_fov_y: cam.fov,
-                        near: 0.2,
-                        far: 120.0,
-                    };
-                }
             }
         }
     }
@@ -457,28 +420,9 @@ mod tests {
     use crate::studio::shapes::bbox;
 
     #[test]
-    fn transformer_and_custom_stage_render_deterministically() {
-        let tf = Transform::new();
-        assert_eq!(tf.counts(), (329, 92448));
-        let stage = Stage::Transformer {
-            transform: Box::new(tf),
-            start: 0.0,
-            rate: 1.0,
-            cam_override: None,
-        };
+    fn a_custom_stage_renders_the_same_twice() {
         let mut scratch = Scratch::new();
         let mut r = Renderer::new(160, 90);
-        stage.eval(3.5, &mut scratch);
-        let px1 = r
-            .render(stage.meshes(), stage.materials(), &scratch.frame)
-            .to_vec();
-        stage.eval(3.5, &mut scratch);
-        let px2 = r
-            .render(stage.meshes(), stage.materials(), &scratch.frame)
-            .to_vec();
-        assert_eq!(px1, px2);
-        assert!(px1.iter().any(|&b| b > 40));
-
         let mut custom = CustomStage::default();
         let mat = custom.add_material(
             Material::metal([0.8, 0.82, 0.86], 0.25),
@@ -495,7 +439,15 @@ mod tests {
         });
         let cstage = Stage::Custom(Box::new(custom));
         cstage.eval(0.0, &mut scratch);
-        let cpx = r.render(cstage.meshes(), cstage.materials(), &scratch.frame);
-        assert_eq!(cpx.len(), 160 * 90 * 3);
+        let first = r
+            .render(cstage.meshes(), cstage.materials(), &scratch.frame)
+            .to_vec();
+        assert_eq!(first.len(), 160 * 90 * 3);
+        assert!(first.iter().any(|&b| b > 40));
+        cstage.eval(0.0, &mut scratch);
+        assert_eq!(
+            first,
+            r.render(cstage.meshes(), cstage.materials(), &scratch.frame)
+        );
     }
 }

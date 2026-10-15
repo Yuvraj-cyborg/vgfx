@@ -21,11 +21,9 @@ pub mod rig;
 pub mod scene;
 pub mod shapes;
 pub mod stage;
-pub mod transformer;
 
 pub use math::{M4, PI, Quat, TAU, V3, cos, quat_from_axes, sin, v3};
 pub use render::Renderer as StudioRenderer;
 pub use rig::{Alt, Belt, Ch, DEG, Ease, Joint, NONE, Parts, Rig, Track, Xf};
 pub use scene::{Camera, Film, Floor, Frame, Instance, Light, Material, Mesh};
 pub use stage::{CamTracks, CustomStage, LampSpec, Part3D, Place3D, Scratch, Stage};
-pub use transformer::Transform;

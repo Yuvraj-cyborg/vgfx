@@ -1,10 +1,11 @@
-//! The full 329-part robot-to-tank transformation assembly, built in code
-//! using `vgfx::studio` primitives, rig, belts, and hydraulic rams.
+//! A robot that changes into a tank: 329 parts built in code from the
+//! studio's shape builders, rig, belts and rams. An example of what the
+//! crate can draw, not part of it.
 
-use super::math::{M4, Quat, TAU, V3, cos, quat_from_axes, sin, v3};
-use super::rig::{Alt, Belt, Ch, DEG, Ease, NONE, Parts, Rig, Track, Xf};
-use super::scene::{Camera, Film, Floor, Frame, Instance, Light, Material, Mesh};
-use super::shapes::{
+use vgfx::studio::math::{M4, Quat, TAU, V3, cos, quat_from_axes, sin, v3};
+use vgfx::studio::rig::{Alt, Belt, Ch, DEG, Ease, NONE, Parts, Rig, Track, Xf};
+use vgfx::studio::scene::{Camera, Film, Floor, Frame, Instance, Light, Material, Mesh};
+use vgfx::studio::shapes::{
     add, along, at, ball, bolt, bx, cx, cyl, cyv, cz, frame_y, join, lathe, lathe_arc, p, prism,
     prism_x, prism_y, ring, scaled, slats, tz,
 };

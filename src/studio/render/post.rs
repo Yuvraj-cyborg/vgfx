@@ -213,10 +213,14 @@ impl Ao {
                     continue;
                 }
                 for j in span(ty, h) {
-                    for i in span(tx, w) {
-                        let o = j * w + i;
-                        let a = clamp01(1.0 - tmps[o]);
-                        ao[o - base] = a * a * (3.0 - 2.0 * a) * 0.5 + a * 0.5;
+                    let r = span(tx, w);
+                    let (src, dst) = (
+                        &tmps[j * w + r.start..j * w + r.end],
+                        &mut ao[j * w - base + r.start..j * w - base + r.end],
+                    );
+                    for (o, t) in dst.iter_mut().zip(src) {
+                        let a = clamp01(1.0 - t);
+                        *o = a * a * (3.0 - 2.0 * a) * 0.5 + a * 0.5;
                     }
                 }
             }
@@ -263,20 +267,57 @@ fn blur(
     step: usize,
     mask: &[u8],
 ) {
+    const WK: [f32; 5] = [1.0, 2.0, 2.0, 2.0, 1.0];
     let span = |t: usize, n: usize| (t << 4)..((t + 1) << 4).min(n);
     let lim = if step == 1 { w } else { h };
+    // A pixel whose five taps all fall in the picture.
+    let whole = |at: usize| at >= 2 && at + 2 < lim;
     for tx in 0..tw {
         if mask[ty * tw + tx] == 0 {
             continue;
         }
         for j in span(ty, h) {
-            for i in span(tx, w) {
+            let cols = span(tx, w);
+            // Along the row, the pixels with every tap: value by value, so
+            // the compiler does several at once.
+            let (i0, i1) = if step == 1 {
+                (
+                    cols.start.max(2),
+                    cols.end.min(w.saturating_sub(2)).max(cols.start.max(2)),
+                )
+            } else if whole(j) {
+                (cols.start, cols.end)
+            } else {
+                (cols.start, cols.start)
+            };
+            if i1 > i0 {
+                let (o0, n) = (j * w + i0, i1 - i0);
+                let zc = &z[o0..o0 + n];
+                let at = |k: usize| o0 + k * step - 2 * step;
+                let zt: [&[f32]; 5] = core::array::from_fn(|k| &z[at(k)..at(k) + n]);
+                let st: [&[f32]; 5] =
+                    core::array::from_fn(|k| &src[at(k) - sbase..at(k) - sbase + n]);
+                let out = &mut dst[o0 - dbase..o0 - dbase + n];
+                for i in 0..n {
+                    let zo = zc[i];
+                    let iz = 12.0 / zo;
+                    let (mut s, mut ws) = (0.0f32, 0.0f32);
+                    for k in 0..5 {
+                        let wt = WK[k] * fmax(1.0 - (zt[k][i] - zo).abs() * iz, 0.0);
+                        s += st[k][i] * wt;
+                        ws += wt;
+                    }
+                    out[i] = s / fmax(ws, 1e-6);
+                }
+            }
+            // The rest, tap by tap.
+            for i in cols.filter(|&i| i < i0 || i >= i1) {
                 let o = j * w + i;
                 let zo = z[o];
                 let at = if step == 1 { i } else { j };
                 let iz = 12.0 / zo;
                 let (mut s, mut ws) = (0.0f32, 0.0f32);
-                for (k, wk) in [1.0f32, 2.0, 2.0, 2.0, 1.0].iter().enumerate() {
+                for (k, wk) in WK.iter().enumerate() {
                     let a = at + k;
                     if a < 2 || a >= lim + 2 {
                         continue;
@@ -297,11 +338,16 @@ const UMAX: f32 = 8.0;
 const BLEV: usize = 6;
 
 pub struct Post {
-    lut: Vec<f32>,
+    /// The tone curve at `NLUT + 1` points, each with the step to the next.
+    lut: Box<[[f32; 2]; NLUT + 1]>,
     bl: Vec<Vec<[f32; 3]>>,
     tmp: Vec<[f32; 3]>,
     dims: Vec<(usize, usize)>,
-    cols: Vec<(u32, u32, f32, f32)>,
+    cols: Vec<(u32, u32, f32)>,
+    /// For each value of a row of pixels (three to a pixel): its column's
+    /// share of the vignette, and its dither on each of four rows.
+    vig: Vec<f32>,
+    dith: [Vec<f32>; 4],
     rows: Vec<[f32; 3]>,
 }
 
@@ -337,11 +383,13 @@ impl Post {
             lh = lh.div_ceil(2);
         }
         Post {
-            lut,
+            lut: Box::new(core::array::from_fn(|i| [lut[i], lut[i + 1] - lut[i]])),
             tmp: vec![[0.0; 3]; dims[0].0 * dims[0].1],
             bl,
             dims,
             cols: Vec::new(),
+            vig: Vec::new(),
+            dith: Default::default(),
             rows: Vec::new(),
         }
     }
@@ -349,7 +397,7 @@ impl Post {
     pub fn bytes(&self) -> usize {
         self.bl.iter().map(|l| l.len() * 12).sum::<usize>()
             + self.tmp.len() * 12
-            + self.lut.len() * 4
+            + self.lut.len() * 8
     }
 
     /// The whole finish, on one thread: `gather` every band, `spread` the
@@ -552,9 +600,13 @@ impl Post {
     /// Where each column of the picture reads the bloom, and its share of
     /// the vignette: what `tone` needs, worked out once a frame.
     pub fn columns(&mut self, w: usize, _h: usize) {
+        const BAYER: [f32; 16] = [
+            0., 8., 2., 10., 12., 4., 14., 6., 3., 11., 1., 9., 15., 7., 13., 5.,
+        ];
         let bw = self.dims[0].0;
         let iw = 2.0 / w as f32;
         self.cols.clear();
+        self.vig.clear();
         for x in 0..w {
             let fx = (x as f32 + 0.5) * 0.25 - 0.5;
             let (x0, tx) = (fx.floor(), fx - fx.floor());
@@ -563,7 +615,12 @@ impl Post {
                 (x0 as i32 + 1).clamp(0, bw as i32 - 1) as usize,
             );
             let ux = (x as f32 + 0.5) * iw - 1.0;
-            self.cols.push((xa as u32, xb as u32, tx, ux * ux * 0.8));
+            self.cols.push((xa as u32, xb as u32, tx));
+            self.vig.extend([ux * ux * 0.8; 3]);
+        }
+        for (r, d) in self.dith.iter_mut().enumerate() {
+            d.clear();
+            d.extend((0..w).flat_map(|x| [(BAYER[r * 4 + (x & 3)] + 0.5) * (1.0 / 16.0); 3]));
         }
     }
 
@@ -581,12 +638,9 @@ impl Post {
         out: &mut [u8],
         rows: &mut Vec<[f32; 3]>,
     ) {
-        const BAYER: [f32; 16] = [
-            0., 8., 2., 10., 12., 4., 14., 6., 3., 11., 1., 9., 15., 7., 13., 5.,
-        ];
         let (bw, bh) = self.dims[0];
         let b0 = &self.bl[0];
-        let lut = &self.lut[..];
+        let lut = &*self.lut;
         let ih = 2.0 / h as f32;
         let us = NLUT as f32 / UMAX;
         rows.resize(3 * w, [0.0; 3]);
@@ -605,7 +659,7 @@ impl Post {
             let uy2 = uy * uy * 0.6;
             if has_bloom && held != (ya, yb) {
                 held = (ya, yb);
-                for (x, &(xa, xb, tx, _)) in self.cols.iter().enumerate() {
+                for (x, &(xa, xb, tx)) in self.cols.iter().enumerate() {
                     let (xa, xb) = (xa as usize, xb as usize);
                     for k in 0..3 {
                         ra[x][k] = b0[ya + xa][k] + (b0[ya + xb][k] - b0[ya + xa][k]) * tx;
@@ -613,27 +667,30 @@ impl Post {
                     }
                 }
             }
-            for x in 0..w {
-                let mut c = src[x];
-                if has_bloom {
-                    for k in 0..3 {
-                        c[k] += ra[x][k] + (rb[x][k] - ra[x][k]) * ty;
-                    }
+            // Value by value along the row, each the same steps as the
+            // others: the compiler does several at once.
+            let vig = |v: f32| 1.0 - 0.20 * (v + uy2);
+            let tone = |c: f32, v: f32| fmin(fmax(c * vig(v), 0.0).sqrt() * us, NLUT as f32);
+            let src = src.as_flattened();
+            let ru = ru.as_flattened_mut();
+            if has_bloom {
+                let (ra, rb) = (ra.as_flattened(), rb.as_flattened());
+                let bloom = ra.iter().zip(rb).map(|(a, b)| a + (b - a) * ty);
+                for (u, ((c, v), add)) in ru.iter_mut().zip(src.iter().zip(&self.vig).zip(bloom)) {
+                    *u = tone(c + add, *v);
                 }
-                let vig = 1.0 - 0.20 * (self.cols[x].3 + uy2);
-                for k in 0..3 {
-                    ru[x][k] = fmin(fmax(c[k] * vig, 0.0).sqrt() * us, NLUT as f32);
+            } else {
+                for (u, (c, v)) in ru.iter_mut().zip(src.iter().zip(&self.vig)) {
+                    *u = tone(*c, *v);
                 }
             }
             let orow = &mut out[yl * w * 3..(yl + 1) * w * 3];
-            for (x, (u3, o)) in ru.iter().zip(orow.as_chunks_mut::<3>().0).enumerate() {
-                let dith = (BAYER[(y & 3) * 4 + (x & 3)] + 0.5) * (1.0 / 16.0);
-                for k in 0..3 {
-                    let u = u3[k];
-                    let i = u as usize;
-                    let v = lut[i] + (lut[i + 1] - lut[i]) * (u - i as f32);
-                    o[k] = (v + dith) as u8;
-                }
+            for (o, (&u, d)) in orow.iter_mut().zip(ru.iter().zip(&self.dith[y & 3])) {
+                // `u` is at most NLUT.
+                let i = u as usize;
+                let [at, step] = lut[i.min(NLUT)];
+                let v = at + step * (u - i as f32);
+                *o = (v + d) as u8;
             }
         }
     }

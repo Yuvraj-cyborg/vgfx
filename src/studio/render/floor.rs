@@ -491,11 +491,11 @@ impl Mirror {
         let floor_on = eye.y > 0.0;
         for y in y0..(y0 + (1 << sh)).min(h) {
             let (gy, fy) = (y / G, ((y % G) as f32 + 0.5) / G as f32);
-            for gx in 0..gw {
-                let (a, b) = (&self.grid[gy * gw + gx], &self.grid[(gy + 1) * gw + gx]);
-                for k in 0..CH {
-                    row[gx][k] = a[k] + (b[k] - a[k]) * fy;
-                }
+            // Value by value, so the compiler does several at once.
+            let a = self.grid[gy * gw..(gy + 1) * gw].as_flattened();
+            let b = self.grid[(gy + 1) * gw..(gy + 2) * gw].as_flattened();
+            for (r, (a, b)) in row.as_flattened_mut().iter_mut().zip(a.iter().zip(b)) {
+                *r = a + (b - a) * fy;
             }
             let yc = y as f32 + 0.5;
             let at = (y - y0) * w;

@@ -110,6 +110,21 @@ pub struct Renderer {
     /// Triangles drawn, surfaces shaded, and triangles cut by the near
     /// plane, in the last `render`.
     pub counts: [usize; 3],
+    /// Opt-in reuse of the key lamp's shadow map. `Some(n)` is the caller's
+    /// promise that every `render` given the same `n` is given the very same
+    /// meshes, unchanged. A frame whose number is the last frame's, and
+    /// whose key lamp (place, aim, size) and instances (mesh and transform)
+    /// are that frame's to the bit, keeps that frame's map instead of
+    /// drawing it again: in a film where only the camera moves, the map is
+    /// drawn once. The picture is the same either way. `None`, the default,
+    /// draws the map every frame. Whether meshes changed is never guessed,
+    /// so a caller that changes them must give a new number.
+    pub mesh_generation: Option<u64>,
+    /// Whether the last `render` kept the shadow map of the frame before.
+    pub shadow_kept: bool,
+    /// The number, and the lamp and instance bits, the map was drawn for.
+    shadow_for: (Option<u64>, Vec<u32>),
+    shadow_now: Vec<u32>,
 }
 
 struct Clock(#[cfg(not(target_arch = "wasm32"))] Option<std::time::Instant>);
@@ -164,6 +179,10 @@ impl Renderer {
             timing: false,
             ms: [0.0; 7],
             counts: [0; 3],
+            mesh_generation: None,
+            shadow_kept: false,
+            shadow_for: (None, Vec::new()),
+            shadow_now: Vec::new(),
         }
     }
 
@@ -181,6 +200,7 @@ impl Renderer {
             + self.mirror.bytes()
             + self.ao.w * self.ao.h * 12
             + self.post.bytes()
+            + (self.shadow_for.1.capacity() + self.shadow_now.capacity()) * 4
     }
 
     /// Draws `frame` and returns the picture: `w * h * 3` bytes, red green
@@ -250,7 +270,23 @@ impl Renderer {
         clock.lap(&mut self.ms[0]);
 
         // ------------------------------------------------------ shadow map
-        self.light.draw(meshes, frame, &self.vbase);
+        // Everything the map is made of besides the meshes, as bits.
+        let now = &mut self.shadow_now;
+        now.clear();
+        let k = &frame.key;
+        now.extend([k.pos.x, k.pos.y, k.pos.z, k.at.x, k.at.y, k.at.z, k.size].map(f32::to_bits));
+        for i in &frame.instances {
+            now.push(i.mesh);
+            now.extend(i.xf.m.map(f32::to_bits));
+        }
+        self.shadow_kept = self.mesh_generation.is_some()
+            && self.shadow_for.0 == self.mesh_generation
+            && self.shadow_for.1 == self.shadow_now;
+        if !self.shadow_kept {
+            self.light.draw(meshes, frame, &self.vbase);
+            self.shadow_for.0 = self.mesh_generation;
+            core::mem::swap(&mut self.shadow_for.1, &mut self.shadow_now);
+        }
         clock.lap(&mut self.ms[1]);
 
         // ------------------------------------------------------ visibility
@@ -422,5 +458,86 @@ impl Renderer {
         );
         clock.lap(&mut self.ms[6]);
         &self.out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::studio::math::{M4, cos, sin, v3};
+    use crate::studio::scene::Instance;
+    use crate::studio::shapes::{ball, bbox};
+
+    fn meshes() -> Vec<Mesh> {
+        vec![
+            bbox(v3(0.0, 0.5, 0.0), v3(0.5, 0.5, 0.5), 0.06),
+            ball(v3(0.0, 0.4, 0.0), 0.4, 1.0, 24),
+        ]
+    }
+
+    fn materials() -> Vec<Material> {
+        vec![
+            Material::metal([0.9, 0.9, 0.92], 0.2),
+            Material::paint([0.7, 0.2, 0.1], 0.5),
+            Material::lamp([6.0, 5.0, 3.0]),
+        ]
+    }
+
+    /// A small scene at moment `k`: the camera goes round; from moment 4
+    /// the lamp has moved, and from moment 6 a part as well.
+    fn frame(k: usize) -> Frame {
+        let a = k as f32 * 0.4;
+        let mut f = Frame::default();
+        f.camera.eye = v3(6.0 * sin(a), 2.2, 6.0 * cos(a));
+        f.camera.target = v3(0.0, 0.6, 0.0);
+        f.fills.push(f.key);
+        f.fills[0].pos = v3(-5.0, 3.0, 2.0);
+        let lift = if k >= 6 { 0.3 } else { 0.0 };
+        let at = |mesh, material, p| Instance {
+            mesh,
+            material,
+            xf: M4::translate(p),
+            glow: 1.0,
+        };
+        f.instances = vec![
+            at(0, 0, v3(-0.8, lift, 0.0)),
+            at(1, 1, v3(0.9, 0.0, 0.3)),
+            at(1, 2, v3(0.0, 1.2, -0.9)),
+        ];
+        if k >= 4 {
+            f.key.pos.x += 0.5;
+        }
+        f
+    }
+
+    #[test]
+    fn a_kept_shadow_map_gives_the_same_picture() {
+        let (ms, mats) = (meshes(), materials());
+        let mut kept = Renderer::new(96, 64);
+        kept.mesh_generation = Some(1);
+        let mut kept_any = false;
+        for k in [0, 1, 2, 3, 4, 5, 6, 7, 2, 2] {
+            let f = frame(k);
+            let fresh = Renderer::new(96, 64).render(&ms, &mats, &f).to_vec();
+            assert_eq!(kept.render(&ms, &mats, &f), &fresh[..], "moment {k}");
+            kept_any |= kept.shadow_kept;
+            // The lamp moves at 4 and a part at 6: the map is drawn again.
+            if k == 4 || k == 6 {
+                assert!(!kept.shadow_kept);
+            }
+        }
+        assert!(kept_any);
+        // Other meshes under another number are never given the old map.
+        let other = vec![ms[1].clone(), ms[0].clone()];
+        kept.mesh_generation = Some(2);
+        let f = frame(2);
+        let fresh = Renderer::new(96, 64).render(&other, &mats, &f).to_vec();
+        assert_eq!(kept.render(&other, &mats, &f), &fresh[..]);
+        assert!(!kept.shadow_kept);
+        // Without a number the map is always drawn.
+        kept.mesh_generation = None;
+        kept.render(&other, &mats, &f);
+        kept.render(&other, &mats, &f);
+        assert!(!kept.shadow_kept);
     }
 }

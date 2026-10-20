@@ -139,8 +139,12 @@ pub struct Renderer {
     /// calling thread alone. The work of a frame is cut into bands of rows
     /// that each write only their own rows, and each band is worked out as
     /// one thread would, so the picture is the same to the bit for any
-    /// number. Threads are started for each frame and gone when `render`
-    /// returns. In WebAssembly a frame is always drawn on one thread.
+    /// number. The calling thread draws too, helped by threads kept in one
+    /// pool for the whole process: started the first time they are asked
+    /// for and kept waiting between passes, for every renderer. WebAssembly
+    /// under WASI (`wasm32-wasip1-threads`) shares the work the same way, as
+    /// far as its host lets it start threads; `wasm32-unknown-unknown`
+    /// always draws a frame on one thread.
     pub threads: usize,
     /// Each thread's scratch rows: for the floor, and for the finish.
     rows_floor: Vec<Vec<[f32; floor::CH]>>,

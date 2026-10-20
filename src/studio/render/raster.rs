@@ -454,7 +454,7 @@ pub fn normals_with(
     threads: usize,
     spans: &mut Vec<Range<usize>>,
 ) {
-    if threads <= 1 || cfg!(target_arch = "wasm32") {
+    if threads <= 1 || par::SERIAL {
         return normals(meshes, frame, vbase, vn);
     }
     vbase.clear();
@@ -697,7 +697,7 @@ pub fn setup_with(
     parts: &mut Vec<Part<Tri>>,
     spans: &mut Vec<Range<usize>>,
 ) -> usize {
-    if threads <= 1 || cfg!(target_arch = "wasm32") {
+    if threads <= 1 || par::SERIAL {
         return setup(pass, meshes, frame, vbase, vn, hv, tris, set, sh);
     }
     runs(meshes, frame, threads * 2, spans);

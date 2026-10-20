@@ -7,9 +7,10 @@
 //!
 //! Depth is `q = 1 / w` (larger is nearer), which is a plane across the screen.
 
-use super::{fmax, fmin};
+use super::{fmax, fmin, par};
 use crate::studio::math::{M4, V3};
-use crate::studio::scene::{Frame, Mesh};
+use crate::studio::scene::{Frame, Instance, Mesh};
+use core::ops::Range;
 
 #[inline(always)]
 pub fn ceil_i(x: f32) -> i32 {
@@ -261,6 +262,12 @@ pub fn scan<S: Sink>(
     v: &[[f32; 2]; 3],
     pl: &[f32; 5],
 ) {
+    scan_rows(sink, w, (0, h), offs, v, pl);
+}
+
+/// The corners top to bottom, as `scan` takes them.
+#[inline(always)]
+fn order(v: &[[f32; 2]; 3]) -> ([f32; 2], [f32; 2], [f32; 2]) {
     let (mut a, mut b, mut c) = (v[0], v[1], v[2]);
     if b[1] < a[1] {
         core::mem::swap(&mut a, &mut b);
@@ -271,23 +278,84 @@ pub fn scan<S: Sink>(
             core::mem::swap(&mut a, &mut b);
         }
     }
-    if !(c[1] > a[1]) {
-        return;
+    (a, b, c)
+}
+
+/// `scan` for the rows from `rows.0` up to `rows.1` only: those rows get the
+/// very samples, with the very values, that `scan` gives them. `rows` must
+/// lie within the picture.
+#[inline(always)]
+pub fn scan_rows<S: Sink>(
+    sink: &mut S,
+    w: i32,
+    rows: (i32, i32),
+    offs: &[(f32, f32)],
+    v: &[[f32; 2]; 3],
+    pl: &[f32; 5],
+) {
+    if let Some(e) = Edges::of(v) {
+        scan_edges(sink, w, rows, offs, &e, pl);
     }
-    let s_ac = (c[0] - a[0]) / (c[1] - a[1]);
-    let s_ab = if b[1] > a[1] {
-        (b[0] - a[0]) / (b[1] - a[1])
-    } else {
-        0.0
-    };
-    let s_bc = if c[1] > b[1] {
-        (c[0] - b[0]) / (c[1] - b[1])
-    } else {
-        0.0
-    };
+}
+
+/// A triangle made ready for `scan`: its corners top to bottom and the
+/// slopes of its edges, worked out once however many bands it is drawn in.
+/// The default covers no rows.
+#[derive(Clone, Copy, Default)]
+pub struct Edges {
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    s_ac: f32,
+    s_ab: f32,
+    s_bc: f32,
+}
+
+impl Edges {
+    /// None for a triangle that covers no rows.
+    #[inline(always)]
+    pub fn of(v: &[[f32; 2]; 3]) -> Option<Edges> {
+        let (a, b, c) = order(v);
+        if !(c[1] > a[1]) {
+            return None;
+        }
+        let s_ac = (c[0] - a[0]) / (c[1] - a[1]);
+        let s_ab = if b[1] > a[1] {
+            (b[0] - a[0]) / (b[1] - a[1])
+        } else {
+            0.0
+        };
+        let s_bc = if c[1] > b[1] {
+            (c[0] - b[0]) / (c[1] - b[1])
+        } else {
+            0.0
+        };
+        Some(Edges {
+            a,
+            b,
+            c,
+            s_ac,
+            s_ab,
+            s_bc,
+        })
+    }
+}
+
+/// `scan_rows` for a triangle already made ready.
+#[inline(always)]
+pub fn scan_edges<S: Sink>(
+    sink: &mut S,
+    w: i32,
+    rows: (i32, i32),
+    offs: &[(f32, f32)],
+    e: &Edges,
+    pl: &[f32; 5],
+) {
+    let (a, b, c) = (e.a, e.b, e.c);
+    let (s_ac, s_ab, s_bc) = (e.s_ac, e.s_ab, e.s_bc);
     for (s, &(ox, oy)) in offs.iter().enumerate() {
-        let r0 = ceil_i(a[1] - oy).max(0);
-        let r1 = ceil_i(c[1] - oy).min(h);
+        let r0 = ceil_i(a[1] - oy).max(rows.0);
+        let r1 = ceil_i(c[1] - oy).min(rows.1);
         let rm = ceil_i(b[1] - oy);
         for r in r0..r1 {
             let ys = r as f32 + oy;
@@ -376,9 +444,56 @@ pub fn normals(meshes: &[Mesh], frame: &Frame, vbase: &mut Vec<u32>, vn: &mut Ve
     }
 }
 
+/// `normals` on up to `threads` threads, a run of instances to each; the
+/// normals are the same. `spans` is scratch.
+pub fn normals_with(
+    meshes: &[Mesh],
+    frame: &Frame,
+    vbase: &mut Vec<u32>,
+    vn: &mut Vec<V3>,
+    threads: usize,
+    spans: &mut Vec<Range<usize>>,
+) {
+    if threads <= 1 || cfg!(target_arch = "wasm32") {
+        return normals(meshes, frame, vbase, vn);
+    }
+    vbase.clear();
+    let mut n = 0;
+    for inst in &frame.instances {
+        vbase.push(n as u32);
+        n += meshes.get(inst.mesh as usize).map_or(0, |m| m.pos.len());
+    }
+    vn.resize(n, V3::ZERO);
+    runs(meshes, frame, threads * 2, spans);
+    let mut rest = &mut vn[..];
+    let mut parts = Vec::with_capacity(spans.len());
+    for run in spans.iter() {
+        let end = vbase.get(run.end).map_or(n, |&e| e as usize);
+        let (mine, more) = core::mem::take(&mut rest).split_at_mut(end - vbase[run.start] as usize);
+        rest = more;
+        parts.push((run.clone(), mine));
+    }
+    par::each0(threads, parts.into_iter(), |(run, out)| {
+        let mut o = out.iter_mut();
+        for inst in &frame.instances[run] {
+            let Some(mesh) = meshes.get(inst.mesh as usize) else {
+                continue;
+            };
+            let x = &inst.xf;
+            let s2 = x.m[0] * x.m[0] + x.m[1] * x.m[1] + x.m[2] * x.m[2];
+            let k = if s2 > 0.0 { 1.0 / s2.sqrt() } else { 0.0 };
+            for i in 0..mesh.pos.len() {
+                let n = mesh.nrm.get(i).copied().unwrap_or(V3::Y);
+                *o.next().unwrap() = x.dir(n) * k;
+            }
+        }
+    });
+}
+
 /// Draws every instance into `buf` and records the triangles that could be
 /// seen. A sample's value is its depth and the triangle's place in `tris`
-/// plus one.
+/// plus one. All in one go; `setup` and `draw_band` draw the same samples a
+/// band of rows at a time.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     pass: &Pass,
@@ -392,11 +507,253 @@ pub fn draw(
     buf: &mut [u64],
     tiles: &mut Tiles,
 ) -> usize {
-    tris.clear();
-    let mut cut = 0;
+    let mut set = Setup::default();
+    let cut = setup(pass, meshes, frame, vbase, vn, hv, tris, &mut set, tiles.sh);
+    // Every triangle, in order, from wherever it was filed.
+    let mut each = vec![None; set.count as usize];
+    for it in set.bins.iter().flatten() {
+        each[it.id as usize] = Some(*it);
+    }
     let plane = (pass.w * pass.h) as usize;
+    for it in each.iter().flatten() {
+        let mut sink = KeySink {
+            buf: &mut *buf,
+            plane,
+            w: pass.w as usize,
+            h: pass.h as usize,
+            ns: offs.len(),
+            id: it.id as u64 + 1,
+            tiles: &mut *tiles,
+        };
+        scan_edges(&mut sink, pass.w, (0, pass.h), offs, &it.e, &it.pl);
+    }
+    cut
+}
+
+/// A triangle filed under a band: its place in the frame's list, its edges
+/// and its depth plane (x0, y0, q0, dq/dx, dq/dy), all a band needs to draw
+/// it, side by side in the order it is drawn.
+#[derive(Clone, Copy, Default)]
+pub struct Item {
+    pub id: u32,
+    pub e: Edges,
+    pub pl: [f32; 5],
+}
+
+/// The triangles of a view, ready to be drawn a band of rows at a time.
+#[derive(Default)]
+pub struct Setup {
+    /// How many triangles were added.
+    pub count: u32,
+    /// For each band of rows, the triangles whose samples may fall in it.
+    pub bins: Vec<Vec<Item>>,
+}
+
+impl Setup {
+    /// Bytes held.
+    pub fn bytes(&self) -> usize {
+        let item = core::mem::size_of::<Item>();
+        self.bins.iter().map(|b| b.capacity() * item).sum()
+    }
+
+    /// Empties it for a picture of `bands` bands.
+    pub fn reset(&mut self, bands: usize) {
+        self.count = 0;
+        self.bins.resize_with(bands, Vec::new);
+        for b in &mut self.bins {
+            b.clear();
+        }
+    }
+
+    /// Adds the next triangle, with corners `v` and depth plane `pl`, and
+    /// files it under every band of `1 << sh` rows, of a picture `h` rows
+    /// high, that a sample anywhere in a pixel inside it can lie in.
+    pub fn add(&mut self, v: [[f32; 2]; 3], pl: [f32; 5], h: i32, sh: usize) {
+        let id = self.count;
+        self.count += 1;
+        let Some(e) = Edges::of(&v) else {
+            return;
+        };
+        // `scan_rows` takes the rows from ceil(a - oy) up to ceil(c - oy),
+        // with oy from 0 to 1.
+        let r0 = ceil_i(e.a[1] - 1.0).max(0);
+        let r1 = ceil_i(e.c[1]).min(h);
+        if r0 >= r1 {
+            return;
+        }
+        for b in &mut self.bins[(r0 as usize >> sh)..=((r1 - 1) as usize >> sh)] {
+            b.push(Item { id, e, pl });
+        }
+    }
+}
+
+/// Sets up every instance's triangles for one view: what each is, where it
+/// lies on the screen, and which bands of `1 << sh` rows it may touch.
+/// Returns how many were cut by the near plane.
+#[allow(clippy::too_many_arguments)]
+pub fn setup(
+    pass: &Pass,
+    meshes: &[Mesh],
+    frame: &Frame,
+    vbase: &[u32],
+    vn: &[V3],
+    hv: &mut Vec<[f32; 4]>,
+    tris: &mut Vec<Tri>,
+    set: &mut Setup,
+    sh: usize,
+) -> usize {
+    tris.clear();
+    set.reset((pass.h as usize).div_ceil(1 << sh));
+    let all = 0..frame.instances.len();
+    setup_run(pass, meshes, frame, vbase, vn, all, hv, tris, set, sh)
+}
+
+/// A run of instances set up on its own: its triangles, with their places
+/// counted from the start of the run.
+pub struct Part<T> {
+    pub items: Vec<T>,
+    pub set: Setup,
+    pub hv: Vec<[f32; 4]>,
+    pub cut: usize,
+}
+
+impl<T> Default for Part<T> {
+    fn default() -> Self {
+        Part {
+            items: Vec::new(),
+            set: Setup::default(),
+            hv: Vec::new(),
+            cut: 0,
+        }
+    }
+}
+
+/// The instances cut into at most `n` runs, in order, of about the same
+/// amount of work.
+pub fn runs(meshes: &[Mesh], frame: &Frame, n: usize, out: &mut Vec<Range<usize>>) {
+    out.clear();
+    let work = |i: &Instance| {
+        meshes
+            .get(i.mesh as usize)
+            .map_or(1, |m| m.idx.len() / 3 + m.pos.len() / 4 + 1)
+    };
+    let total: usize = frame.instances.iter().map(work).sum();
+    let each = total.div_ceil(n.max(1)).max(1);
+    let (mut start, mut acc) = (0, 0);
+    for (i, inst) in frame.instances.iter().enumerate() {
+        acc += work(inst);
+        if acc >= each {
+            out.push(start..i + 1);
+            (start, acc) = (i + 1, 0);
+        }
+    }
+    if start < frame.instances.len() {
+        out.push(start..frame.instances.len());
+    }
+}
+
+/// Joins the parts' triangles, in order, into `all` and `set` (of `bands`
+/// bands): what setting them all up in one run would have made.
+pub fn join<T: Copy + Send + Sync>(
+    parts: &[Part<T>],
+    all: &mut Vec<T>,
+    set: &mut Setup,
+    bands: usize,
+    threads: usize,
+) {
+    all.clear();
+    for p in parts {
+        all.extend_from_slice(&p.items);
+    }
+    set.count = parts.iter().map(|p| p.set.count).sum();
+    set.bins.resize_with(bands, Vec::new);
+    par::each0(threads, set.bins.iter_mut().enumerate(), |(k, b)| {
+        b.clear();
+        let mut at = 0;
+        for p in parts {
+            b.extend(p.set.bins[k].iter().map(|&it| Item {
+                id: it.id + at,
+                ..it
+            }));
+            at += p.set.count;
+        }
+    });
+}
+
+/// `setup` on up to `threads` threads, a run of instances to each, with the
+/// same result. `parts` and `spans` are scratch.
+#[allow(clippy::too_many_arguments)]
+pub fn setup_with(
+    pass: &Pass,
+    meshes: &[Mesh],
+    frame: &Frame,
+    vbase: &[u32],
+    vn: &[V3],
+    hv: &mut Vec<[f32; 4]>,
+    tris: &mut Vec<Tri>,
+    set: &mut Setup,
+    sh: usize,
+    threads: usize,
+    parts: &mut Vec<Part<Tri>>,
+    spans: &mut Vec<Range<usize>>,
+) -> usize {
+    if threads <= 1 || cfg!(target_arch = "wasm32") {
+        return setup(pass, meshes, frame, vbase, vn, hv, tris, set, sh);
+    }
+    runs(meshes, frame, threads * 2, spans);
+    if parts.len() < spans.len() {
+        parts.resize_with(spans.len(), Part::default);
+    }
+    let parts = &mut parts[..spans.len()];
+    let bands = (pass.h as usize).div_ceil(1 << sh);
+    par::each0(
+        threads,
+        parts.iter_mut().zip(spans.iter().cloned()),
+        |(p, run)| {
+            p.items.clear();
+            p.set.reset(bands);
+            p.cut = setup_run(
+                pass,
+                meshes,
+                frame,
+                vbase,
+                vn,
+                run,
+                &mut p.hv,
+                &mut p.items,
+                &mut p.set,
+                sh,
+            );
+        },
+    );
+    join(parts, tris, set, bands, threads);
+    parts.iter().map(|p| p.cut).sum()
+}
+
+/// Sets up the instances of `run`, adding their triangles to `tris` and
+/// `set`.
+#[allow(clippy::too_many_arguments)]
+fn setup_run(
+    pass: &Pass,
+    meshes: &[Mesh],
+    frame: &Frame,
+    vbase: &[u32],
+    vn: &[V3],
+    run: Range<usize>,
+    hv: &mut Vec<[f32; 4]>,
+    tris: &mut Vec<Tri>,
+    set: &mut Setup,
+    sh: usize,
+) -> usize {
+    let mut cut = 0;
     let (wf, hf) = (pass.w as f32, pass.h as f32);
-    for (ii, inst) in frame.instances.iter().enumerate() {
+    for (ii, inst) in frame
+        .instances
+        .iter()
+        .enumerate()
+        .take(run.end)
+        .skip(run.start)
+    {
         let Some(mesh) = meshes.get(inst.mesh as usize) else {
             continue;
         };
@@ -512,25 +869,248 @@ pub fn draw(
                     ng,
                     nvar,
                 });
-                let mut sink = KeySink {
-                    buf: &mut *buf,
-                    plane,
-                    w: pass.w as usize,
-                    h: pass.h as usize,
-                    ns: offs.len(),
-                    id: tris.len() as u64,
-                    tiles: &mut *tiles,
-                };
-                scan(
-                    &mut sink,
-                    pass.w,
-                    pass.h,
-                    offs,
-                    &[[p0[0], p0[1]], [p1[0], p1[1]], [p2[0], p2[1]]],
-                    &[p0[0], p0[1], p0[2], dq.0, dq.1],
-                );
+                let corners = [[p0[0], p0[1]], [p1[0], p1[1]], [p2[0], p2[1]]];
+                set.add(corners, [p0[0], p0[1], p0[2], dq.0, dq.1], pass.h, sh);
             }
         }
     }
     cut
+}
+
+/// One band of `1 << sh` rows of a view, from row `y0`: its keys, a row of
+/// each sample in turn for each row of pixels (row `y`, sample `s` at
+/// `(y - y0) * NS + s` rows in), and its row of tile marks.
+pub struct KeyBand<'a> {
+    pub y0: usize,
+    pub keys: &'a mut [u64],
+    pub marks: &'a mut [u8],
+}
+
+struct BandSink<'a> {
+    keys: &'a mut [u64],
+    marks: &'a mut [u8],
+    y0: usize,
+    w: usize,
+    sh: usize,
+    id: u64,
+}
+
+impl Sink for BandSink<'_> {
+    #[inline(always)]
+    fn span(&mut self, s: usize, r: usize, c0: usize, n: usize, mut q: f32, dq: f32) {
+        let (w, sh) = (self.w, self.sh);
+        for tc in (c0 >> sh)..=((c0 + n - 1) >> sh) {
+            if self.marks[tc] == 0 {
+                self.marks[tc] = 1;
+                let (x0, x1) = (tc << sh, ((tc + 1) << sh).min(w));
+                for row in self.keys.chunks_mut(w) {
+                    row[x0..x1].fill(0);
+                }
+            }
+        }
+        let at = ((r - self.y0) * NS + s) * w + c0;
+        for k in &mut self.keys[at..at + n] {
+            let key = ((q.to_bits() as u64) << 32) | self.id;
+            if key > *k {
+                *k = key;
+            }
+            q += dq;
+        }
+    }
+}
+
+/// Draws the triangles filed under band `k` into it, four samples to a
+/// pixel at `OFFS`: its samples come out as `draw` makes them. A tile's
+/// samples are cleared the first time anything lands in it.
+pub fn draw_band(pass: &Pass, sh: usize, set: &Setup, k: usize, band: &mut KeyBand) {
+    let rows = (
+        band.y0 as i32,
+        (band.y0 + (1 << sh)).min(pass.h as usize) as i32,
+    );
+    let mut sink = BandSink {
+        keys: &mut *band.keys,
+        marks: &mut *band.marks,
+        y0: band.y0,
+        w: pass.w as usize,
+        sh,
+        id: 0,
+    };
+    for it in &set.bins[k] {
+        sink.id = it.id as u64 + 1;
+        scan_edges(&mut sink, pass.w, rows, &OFFS, &it.e, &it.pl);
+    }
+}
+
+/// `resolve` for one band of `1 << sh` rows: appends the band's surfaces to
+/// `frags`, in the order `resolve` finds them, and fills its rows of `open`.
+pub fn resolve_band(
+    band: &KeyBand,
+    w: usize,
+    sh: usize,
+    tris: &[Tri],
+    frags: &mut Vec<Frag>,
+    open: &mut [u8],
+) {
+    for ((y, row), k) in open.chunks_mut(w).enumerate().zip(band.keys.chunks(NS * w)) {
+        for (tx, _) in band.marks.iter().enumerate().filter(|m| *m.1 != 0) {
+            for x in tx << sh..((tx + 1) << sh).min(w) {
+                let px = ((band.y0 + y) * w + x) as u32;
+                let ids = [
+                    k[x] as u32,
+                    k[w + x] as u32,
+                    k[2 * w + x] as u32,
+                    k[3 * w + x] as u32,
+                ];
+                if ids[0] == ids[1] && ids[0] == ids[2] && ids[0] == ids[3] {
+                    if ids[0] == 0 {
+                        row[x] = NS as u8;
+                    } else {
+                        row[x] = 0;
+                        frags.push(Frag {
+                            px,
+                            tri: ids[0] - 1,
+                            bits: 4 | 15 << 4,
+                        });
+                    }
+                    continue;
+                }
+                let (mut used, mut free) = (0u32, 0u8);
+                for s in 0..NS {
+                    if used >> s & 1 == 1 {
+                        continue;
+                    }
+                    if ids[s] == 0 {
+                        free += 1;
+                        continue;
+                    }
+                    let t = &tris[ids[s] as usize - 1];
+                    let mut own = 1u32 << s;
+                    let mut all = own;
+                    for (s2, &id2) in ids.iter().enumerate().skip(s + 1) {
+                        if used >> s2 & 1 == 1 || id2 == 0 {
+                            continue;
+                        }
+                        if id2 == ids[s] {
+                            own |= 1 << s2;
+                            all |= 1 << s2;
+                        } else {
+                            let t2 = &tris[id2 as usize - 1];
+                            if t2.inst == t.inst && t2.ng.dot(t.ng) > 0.9 {
+                                all |= 1 << s2;
+                            }
+                        }
+                    }
+                    used |= all;
+                    frags.push(Frag {
+                        px,
+                        tri: ids[s] - 1,
+                        bits: all.count_ones() | own << 4,
+                    });
+                }
+                row[x] = free;
+            }
+        }
+    }
+}
+
+/// A view's keys (`NS * w` to a row of pixels, laid out as `KeyBand` says;
+/// `draw` and `resolve` take a plane a sample instead) and its tile marks,
+/// cut into one `KeyBand` per row of tiles.
+pub fn key_bands<'a>(
+    keys: &'a mut [u64],
+    w: usize,
+    h: usize,
+    tiles: &'a mut Tiles,
+) -> impl Iterator<Item = (usize, KeyBand<'a>)> + Send + 'a {
+    let (sh, tw) = (tiles.sh, tiles.tw);
+    let bands = keys[..w * h * NS].chunks_mut((NS * w) << sh);
+    let marks = tiles.f.chunks_mut(tw);
+    bands.zip(marks).enumerate().map(move |(k, (keys, marks))| {
+        (
+            k,
+            KeyBand {
+                y0: k << sh,
+                keys,
+                marks,
+            },
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::studio::math::{M4, v3};
+    use crate::studio::scene::Instance;
+    use crate::studio::shapes::{ball, bbox};
+
+    #[test]
+    fn bands_draw_and_gather_what_one_pass_does() {
+        let meshes = vec![
+            bbox(v3(0.0, 0.5, 0.0), v3(0.5, 0.5, 0.5), 0.06),
+            ball(v3(0.0, 0.4, 0.0), 0.4, 1.0, 20),
+        ];
+        // A row of parts, the last one through the near plane.
+        let frame = Frame {
+            instances: (0..13)
+                .map(|i| {
+                    let z = if i == 12 { 5.8 } else { (i % 4) as f32 * -0.5 };
+                    let p = v3(i as f32 * 0.37 - 2.2, (i % 3) as f32 * 0.4, z);
+                    Instance {
+                        mesh: i % 2,
+                        material: 0,
+                        xf: M4::translate(p),
+                        glow: 1.0,
+                    }
+                })
+                .collect(),
+            ..Frame::default()
+        };
+        let (mut vbase, mut vn) = (Vec::new(), Vec::new());
+        normals(&meshes, &frame, &mut vbase, &mut vn);
+        for (w, h) in [(157usize, 99usize), (40, 20)] {
+            // From (0, 1, 6) toward -z.
+            let (f, cx, cy) = (w as f32 * 0.6, w as f32 * 0.5, h as f32 * 0.5);
+            let rw = [0.0, 0.0, -1.0, 6.0];
+            let pass = Pass {
+                m: [[f, 0.0, -cx, 6.0 * cx], [0.0, -f, -cy, f + 6.0 * cy], rw],
+                near: 0.1,
+                w: w as i32,
+                h: h as i32,
+                front: -1.0,
+            };
+            let mut hv = Vec::new();
+            let (mut tris, mut keys, mut tiles) =
+                (Vec::new(), vec![0; w * h * NS], Tiles::new(w, h, 5));
+            let (mut frags, mut open) = (Vec::new(), vec![0; w * h]);
+            let cut = draw(
+                &pass, &OFFS, &meshes, &frame, &vbase, &vn, &mut hv, &mut tris, &mut keys,
+                &mut tiles,
+            );
+            resolve(&keys, w, h, &tiles, &tris, &mut frags, &mut open);
+            assert!(cut > 0 && frags.len() > 100);
+
+            let (mut tris2, mut keys2, mut tiles2) =
+                (Vec::new(), vec![0; w * h * NS], Tiles::new(w, h, 5));
+            let (mut frags2, mut open2, mut set) = (Vec::new(), vec![0; w * h], Setup::default());
+            let cut2 = setup(
+                &pass, &meshes, &frame, &vbase, &vn, &mut hv, &mut tris2, &mut set, 5,
+            );
+            let mut rows = open2.chunks_mut(w << 5);
+            for (k, mut band) in key_bands(&mut keys2, w, h, &mut tiles2) {
+                band.marks.fill(0);
+                draw_band(&pass, 5, &set, k, &mut band);
+                resolve_band(&band, w, 5, &tris2, &mut frags2, rows.next().unwrap());
+            }
+            assert_eq!(cut, cut2);
+            // The bands hold each row's samples in turn; `draw` a plane each.
+            let planes: Vec<u64> = (0..NS)
+                .flat_map(|s| (0..h).flat_map(move |y| (0..w).map(move |x| (s, y, x))))
+                .map(|(s, y, x)| keys2[(y * NS + s) * w + x])
+                .collect();
+            assert!(keys == planes && tiles.f == tiles2.f && open == open2);
+            let list = |f: &[Frag]| f.iter().map(|f| (f.px, f.tri, f.bits)).collect::<Vec<_>>();
+            assert_eq!(list(&frags), list(&frags2));
+        }
+    }
 }

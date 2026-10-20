@@ -1,4 +1,4 @@
-//! Draws a frame on the CPU, one thread, no GPU.
+//! Draws a frame on the CPU, no GPU, on one thread or several.
 //!
 //! The order of work, and where each part lives:
 //!
@@ -14,18 +14,24 @@
 //!
 //! On the way to a pixel only +, -, *, /, sqrt, floor, abs, comparisons and
 //! integer work are used, so the bytes are the same on every machine.
+//!
+//! Each step after the setup is done a band of rows at a time (a row of
+//! tiles), and a band writes only its own rows and works them out as the
+//! whole picture would: the bands can go to any number of threads (`par`)
+//! and the bytes stay the same.
 
 use super::math::V3;
 use super::scene::{Frame, Material, Mesh};
 
 pub mod floor;
 pub mod light;
+mod par;
 pub mod post;
 pub mod raster;
 pub mod shade;
 
 pub use raster::NS;
-use raster::{Frag, OFFS, Pass, Tiles, Tri};
+use raster::{Frag, Pass, Setup, Tiles, Tri};
 use shade::{Ctx, Inst, Lamp, Mat};
 
 #[inline(always)]
@@ -83,12 +89,16 @@ pub struct Renderer {
     pub w: usize,
     pub h: usize,
     out: Vec<u8>,
+    /// Each sample's depth and triangle: for each row of pixels, a row of
+    /// each sample in turn (see `raster::KeyBand`).
     keys: Vec<u64>,
     tris: Vec<Tri>,
     hv: Vec<[f32; 4]>,
     vn: Vec<V3>,
     vbase: Vec<u32>,
-    frags: Vec<Frag>,
+    /// The picture's triangles, by band, and each band's surfaces.
+    set: Setup,
+    frags: Vec<Vec<Frag>>,
     open: Vec<u8>,
     /// Which 32-pixel tiles of the picture hold any mesh, and which may hold
     /// anything bright enough to bloom.
@@ -125,6 +135,19 @@ pub struct Renderer {
     /// The number, and the lamp and instance bits, the map was drawn for.
     shadow_for: (Option<u64>, Vec<u32>),
     shadow_now: Vec<u32>,
+    /// How many threads one `render` may use; 1, the default, draws on the
+    /// calling thread alone. The work of a frame is cut into bands of rows
+    /// that each write only their own rows, and each band is worked out as
+    /// one thread would, so the picture is the same to the bit for any
+    /// number. Threads are started for each frame and gone when `render`
+    /// returns. In WebAssembly a frame is always drawn on one thread.
+    pub threads: usize,
+    /// Each thread's scratch rows: for the floor, and for the finish.
+    rows_floor: Vec<Vec<[f32; floor::CH]>>,
+    rows_tone: Vec<Vec<[f32; 3]>>,
+    /// Runs of instances set up apart when several threads share the work.
+    spans: Vec<core::ops::Range<usize>>,
+    parts: Vec<raster::Part<Tri>>,
 }
 
 struct Clock(#[cfg(not(target_arch = "wasm32"))] Option<std::time::Instant>);
@@ -154,6 +177,7 @@ impl Renderer {
         let (w, h) = (w.max(1), h.max(1));
         let (w2, h2) = (w.div_ceil(2), h.div_ceil(2));
         let cent = raster::cent_table();
+        let tiles = Tiles::new(w, h, 5);
         Renderer {
             w,
             h,
@@ -163,9 +187,10 @@ impl Renderer {
             hv: Vec::new(),
             vn: Vec::new(),
             vbase: Vec::new(),
-            frags: Vec::new(),
+            set: Setup::default(),
+            frags: (0..tiles.th).map(|_| Vec::new()).collect(),
             open: vec![0; w * h],
-            tiles: Tiles::new(w, h, 5),
+            tiles,
             bright: vec![0; ((w + 31) >> 5) * ((h + 31) >> 5)],
             hdr: vec![[0.0; 3]; w * h],
             mats: Vec::new(),
@@ -183,6 +208,11 @@ impl Renderer {
             shadow_kept: false,
             shadow_for: (None, Vec::new()),
             shadow_now: Vec::new(),
+            threads: 1,
+            rows_floor: Vec::new(),
+            rows_tone: Vec::new(),
+            spans: Vec::new(),
+            parts: Vec::new(),
         }
     }
 
@@ -193,7 +223,8 @@ impl Renderer {
             + (self.tris.capacity() + self.mirror.tris.capacity()) * core::mem::size_of::<Tri>()
             + self.hv.capacity() * 16
             + self.vn.capacity() * 12
-            + self.frags.capacity() * 12
+            + self.set.bytes()
+            + self.frags.iter().map(|f| f.capacity() * 12).sum::<usize>()
             + self.open.len()
             + self.hdr.len() * 12
             + self.light.bytes()
@@ -204,14 +235,24 @@ impl Renderer {
     }
 
     /// Draws `frame` and returns the picture: `w * h * 3` bytes, red green
-    /// blue, rows from the top. One call uses one thread and is a pure
-    /// function of its arguments.
+    /// blue, rows from the top. A pure function of its arguments, on as
+    /// many threads as `threads` says.
     pub fn render(&mut self, meshes: &[Mesh], materials: &[Material], frame: &Frame) -> &[u8] {
         let mut clock = Clock::new(self.timing);
         let (w, h) = (self.w, self.h);
+        let threads = self.threads.clamp(1, par::MAX_THREADS);
+        self.rows_floor.resize_with(threads, Vec::new);
+        self.rows_tone.resize_with(threads, Vec::new);
 
         // ------------------------------------------------------------ setup
-        raster::normals(meshes, frame, &mut self.vbase, &mut self.vn);
+        raster::normals_with(
+            meshes,
+            frame,
+            &mut self.vbase,
+            &mut self.vn,
+            threads,
+            &mut self.spans,
+        );
         self.mats.clear();
         self.mats.extend(materials.iter().map(Mat::of));
         // An instance that names a material that is not there is drawn grey.
@@ -283,14 +324,13 @@ impl Renderer {
             && self.shadow_for.0 == self.mesh_generation
             && self.shadow_for.1 == self.shadow_now;
         if !self.shadow_kept {
-            self.light.draw(meshes, frame, &self.vbase);
+            self.light.draw_with(meshes, frame, &self.vbase, threads);
             self.shadow_for.0 = self.mesh_generation;
             core::mem::swap(&mut self.shadow_for.1, &mut self.shadow_now);
         }
         clock.lap(&mut self.ms[1]);
 
         // ------------------------------------------------------ visibility
-        self.tiles.reset();
         let pass = Pass {
             m: rows(fpx, w as f32 * 0.5, h as f32 * 0.5, 1.0),
             near,
@@ -298,28 +338,38 @@ impl Renderer {
             h: h as i32,
             front: -1.0,
         };
-        let cut = raster::draw(
+        let sh = self.tiles.sh;
+        let cut = raster::setup_with(
             &pass,
-            &OFFS,
             meshes,
             frame,
             &self.vbase,
             &self.vn,
             &mut self.hv,
             &mut self.tris,
-            &mut self.keys,
-            &mut self.tiles,
+            &mut self.set,
+            sh,
+            threads,
+            &mut self.parts,
+            &mut self.spans,
         );
-        raster::resolve(
-            &self.keys,
-            w,
-            h,
-            &self.tiles,
-            &self.tris,
-            &mut self.frags,
-            &mut self.open,
-        );
-        self.counts = [self.tris.len(), self.frags.len(), cut];
+        {
+            // Each band of rows drawn, its tiles' marks cleared first, then
+            // gathered into surfaces.
+            let (tris, set) = (&self.tris, &self.set);
+            let mut open = self.open.chunks_mut(w << sh);
+            let mut frags = self.frags.iter_mut();
+            let bands = raster::key_bands(&mut self.keys, w, h, &mut self.tiles)
+                .map(move |(k, band)| (k, band, open.next().unwrap(), frags.next().unwrap()));
+            par::each0(threads, bands, |(k, mut band, open, frags)| {
+                band.marks.fill(0);
+                raster::draw_band(&pass, sh, set, k, &mut band);
+                frags.clear();
+                raster::resolve_band(&band, w, sh, tris, frags, open);
+            });
+        }
+        let surfaces = self.frags.iter().map(Vec::len).sum();
+        self.counts = [self.tris.len(), surfaces, cut];
         clock.lap(&mut self.ms[2]);
 
         // ------------------------------------------------ floor and mirror
@@ -339,27 +389,31 @@ impl Renderer {
         };
         let (m0, mdx, mdy) = ray(mfp, w as f32 * 0.25, h as f32 * 0.25);
         let (r0, rdx, rdy) = ray(fpx, w as f32 * 0.5, h as f32 * 0.5);
-        self.mirror.tiles.reset();
+        let mpass = Pass {
+            m: rows(mfp, w as f32 * 0.25, h as f32 * 0.25, -1.0),
+            near,
+            w: mw as i32,
+            h: mh as i32,
+            front: 1.0,
+        };
         if eye.y > 0.0 && frame.floor.mirror > 0.0 {
-            let mpass = Pass {
-                m: rows(mfp, w as f32 * 0.25, h as f32 * 0.25, -1.0),
-                near,
-                w: mw as i32,
-                h: mh as i32,
-                front: 1.0,
-            };
-            raster::draw(
+            raster::setup_with(
                 &mpass,
-                &OFFS,
                 meshes,
                 frame,
                 &self.vbase,
                 &self.vn,
                 &mut self.hv,
                 &mut self.mirror.tris,
-                &mut self.mirror.keys,
-                &mut self.mirror.tiles,
+                &mut self.mirror.set,
+                self.mirror.tiles.sh,
+                threads,
+                &mut self.parts,
+                &mut self.spans,
             );
+        } else {
+            // Nothing is mirrored: every band is left empty.
+            self.mirror.set.reset(self.mirror.tiles.th);
         }
         let base = Ctx {
             eye,
@@ -385,9 +439,10 @@ impl Renderer {
             rdy: flip(mdy),
             ..base
         };
-        self.mirror.shade(&under, &self.cent);
+        self.mirror
+            .draw_and_shade(Some(&mpass), &under, &self.cent, threads);
         self.bright.copy_from_slice(&self.tiles.f);
-        self.mirror.floor(
+        self.mirror.floor_with(
             &base,
             &frame.floor,
             w,
@@ -399,6 +454,8 @@ impl Renderer {
             frame.exposure,
             &mut self.hdr,
             &mut self.bright,
+            threads,
+            &mut self.rows_floor,
         );
         clock.lap(&mut self.ms[3]);
 
@@ -410,8 +467,10 @@ impl Renderer {
         } else {
             [0.0; 3]
         };
-        self.ao.compute(
-            &self.keys[..w * h],
+        // Each row of the picture's keys holds a row of each sample in turn.
+        self.ao.compute_with(
+            &self.keys,
+            NS * w,
             &self.tris,
             &self.tiles,
             w,
@@ -421,40 +480,62 @@ impl Renderer {
             fwd,
             fpx,
             fq,
+            threads,
         );
         clock.lap(&mut self.ms[4]);
 
         // --------------------------------------------------------- shading
+        // A band's surfaces are all in its own rows.
         let inv_ns = 1.0 / NS as f32;
-        for f in &self.frags {
-            let t = &self.tris[f.tri as usize];
-            let (x, y) = (f.px as usize % w, f.px as usize / w);
-            let (ox, oy) = self.cent[(f.bits >> 4) as usize & 15];
-            let sf = shade::surf(&base, t, x as f32 + ox, y as f32 + oy);
-            let ao = self.ao.at(x, y, sf.w);
-            let c = compress(
-                shade::shade(&base, &sf, t, ao),
-                (f.bits & 15) as f32 * inv_ns,
-            );
-            let o = &mut self.hdr[f.px as usize];
-            o[0] += c[0];
-            o[1] += c[1];
-            o[2] += c[2];
+        {
+            let (tris, cent, ao) = (&self.tris, &self.cent, &self.ao);
+            let bands = self.hdr.chunks_mut(w << sh).zip(&self.frags).enumerate();
+            par::each0(threads, bands, |(k, (hdr, frags))| {
+                let at = (k << sh) * w;
+                for f in frags {
+                    let t = &tris[f.tri as usize];
+                    let (x, y) = (f.px as usize % w, f.px as usize / w);
+                    let (ox, oy) = cent[(f.bits >> 4) as usize & 15];
+                    let sf = shade::surf(&base, t, x as f32 + ox, y as f32 + oy);
+                    let ao = ao.at(x, y, sf.w);
+                    let c = compress(
+                        shade::shade(&base, &sf, t, ao),
+                        (f.bits & 15) as f32 * inv_ns,
+                    );
+                    let o = &mut hdr[f.px as usize - at];
+                    o[0] += c[0];
+                    o[1] += c[1];
+                    o[2] += c[2];
+                }
+            });
         }
         clock.lap(&mut self.ms[5]);
 
         // ---------------------------------------------------------- finish
-        self.post.finish(
+        let has_bloom = self.post.gather_all(
             &mut self.hdr,
             w,
-            h,
             frame.exposure,
             frame.bloom,
             &self.open,
             &self.tiles,
             &self.bright,
             NS,
+            threads,
+        );
+        if has_bloom {
+            self.post.spread(frame.bloom, threads);
+        }
+        self.post.columns(w, h);
+        self.post.tone_all(
+            &self.hdr,
+            w,
+            h,
+            sh,
+            has_bloom,
             &mut self.out,
+            threads,
+            &mut self.rows_tone,
         );
         clock.lap(&mut self.ms[6]);
         &self.out
@@ -539,5 +620,35 @@ mod tests {
         kept.render(&other, &mats, &f);
         kept.render(&other, &mats, &f);
         assert!(!kept.shadow_kept);
+    }
+
+    #[test]
+    fn any_number_of_threads_draws_the_same_picture() {
+        let (ms, mats) = (meshes(), materials());
+        // Sizes that end in part of a band, and one band high.
+        for (w, h) in [(203, 117), (64, 31)] {
+            let mut one = Renderer::new(w, h);
+            let mut many: Vec<Renderer> = [2, 3, 8]
+                .map(|n| {
+                    let mut r = Renderer::new(w, h);
+                    r.threads = n;
+                    r
+                })
+                .into();
+            for k in [0, 3, 6, 9] {
+                let mut f = frame(k);
+                if k == 9 {
+                    // From under the floor: nothing mirrored, no floor.
+                    f.camera.eye.y = -0.5;
+                }
+                let want = one.render(&ms, &mats, &f).to_vec();
+                assert!(want.iter().any(|&b| b > 60), "the scene is in the picture");
+                for r in &mut many {
+                    let n = r.threads;
+                    let got = r.render(&ms, &mats, &f);
+                    assert_eq!(got, &want[..], "{w}x{h} moment {k} on {n} threads");
+                }
+            }
+        }
     }
 }

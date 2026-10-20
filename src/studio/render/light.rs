@@ -15,14 +15,19 @@
 //! The window sits on a fixed grid in the lamp's view and moves in steps of 64
 //! texels, so a still shadow has still texels whatever else moves.
 
-use super::raster::{DepthSink, Tiles, scan};
+use super::par;
+use super::raster::{Part, Setup, Sink, Tiles, join, runs, scan_edges};
 use super::{clamp01, fmax, fmin};
 use crate::studio::math::{M4, V3, v3};
 use crate::studio::scene::{Frame, Mesh};
+use core::ops::Range;
 
 pub const N: usize = 2048;
 /// Levels above the map itself: level l is N >> l across.
 const LEVELS: usize = 8;
+/// The levels whose tiles are a texel or more across: each row of tiles is
+/// built up to there on its own.
+const BANDED: usize = 6;
 /// For testing only: when set, a mesh's shadow is worked out on the map
 /// itself, texel by texel, however wide. Slow; what the levels approximate.
 const EXHAUSTIVE: bool = false;
@@ -58,6 +63,48 @@ pub struct Light {
     /// Lamp radius in texels at unit depth.
     k: f32,
     qglobal: f32,
+    /// The faces drawn into the map, in texels, by row of tiles.
+    set: Setup,
+    /// Which points are in front of the lamp, and the runs of instances
+    /// and their faces when several threads set them up.
+    seen: Vec<bool>,
+    spans: Vec<Range<usize>>,
+    parts: Vec<Part<()>>,
+}
+
+/// One row of tiles of the map, and of the levels built from it.
+struct Band<'a> {
+    k: usize,
+    d: &'a mut [f32],
+    marks: &'a mut [u8],
+    prev: &'a mut [u8],
+    qmax: [&'a mut [f32]; BANDED],
+    qmin: [&'a mut [f32]; BANDED],
+    cov: [&'a mut [[f32; 2]]; BANDED],
+    dec: [&'a mut [f32]; BANDED],
+}
+
+/// Depth alone into a row of tiles of the map, marking the tiles it writes in.
+struct DepthBand<'a> {
+    buf: &'a mut [f32],
+    y0: usize,
+    marks: &'a mut [u8],
+}
+
+impl Sink for DepthBand<'_> {
+    #[inline(always)]
+    fn span(&mut self, _s: usize, r: usize, c0: usize, n: usize, mut q: f32, dq: f32) {
+        for tc in (c0 >> 6)..=((c0 + n - 1) >> 6) {
+            self.marks[tc] = 1;
+        }
+        let at = (r - self.y0) * N + c0;
+        for d in &mut self.buf[at..at + n] {
+            if q > *d {
+                *d = q;
+            }
+            q += dq;
+        }
+    }
 }
 
 #[inline(always)]
@@ -103,6 +150,10 @@ impl Light {
             itau: 1.0,
             k: 0.0,
             qglobal: 0.0,
+            set: Setup::default(),
+            seen: Vec::new(),
+            spans: Vec::new(),
+            parts: Vec::new(),
         };
         for lv in 1..=LEVELS {
             let n = N >> lv;
@@ -116,6 +167,11 @@ impl Light {
 
     /// Draws the map for this frame.
     pub fn draw(&mut self, meshes: &[Mesh], frame: &Frame, vbase: &[u32]) {
+        self.draw_with(meshes, frame, vbase, 1);
+    }
+
+    /// `draw` on up to `threads` threads; the map is the same.
+    pub fn draw_with(&mut self, meshes: &[Mesh], frame: &Frame, vbase: &[u32], threads: usize) {
         let key = &frame.key;
         self.pos = key.pos;
         let f = (key.at - key.pos).norm();
@@ -128,28 +184,58 @@ impl Light {
         self.ax = v3(m[0], m[4], m[8]);
         self.ay = v3(m[1], m[5], m[9]);
 
-        // Where everything is, seen from the lamp.
-        self.uvq.clear();
-        let (mut ulo, mut uhi, mut vlo, mut vhi) = (1e30f32, -1e30f32, 1e30f32, -1e30f32);
-        for inst in &frame.instances {
-            let Some(mesh) = meshes.get(inst.mesh as usize) else {
-                continue;
-            };
-            for p in &mesh.pos {
-                let wp = inst.xf.point(*p);
-                let w = dot4(&self.rw, wp);
-                if w > 0.05 {
-                    let q = 1.0 / w;
-                    let (u, v) = (dot4(&self.rx, wp) * q, dot4(&self.ry, wp) * q);
-                    ulo = fmin(ulo, u);
-                    uhi = fmax(uhi, u);
-                    vlo = fmin(vlo, v);
-                    vhi = fmax(vhi, v);
-                    self.uvq.push([u, v, q]);
-                } else {
-                    self.uvq.push([0.0, 0.0, 0.0]);
+        // Where everything is, seen from the lamp: a run of instances to a
+        // thread, then the bounds, point by point in order.
+        let n = vbase.len().checked_sub(1).map_or(0, |last| {
+            let inst = &frame.instances[last];
+            vbase[last] as usize + meshes.get(inst.mesh as usize).map_or(0, |m| m.pos.len())
+        });
+        self.uvq.resize(n, [0.0; 3]);
+        self.seen.resize(n, false);
+        runs(
+            meshes,
+            frame,
+            if threads > 1 { threads * 2 } else { 1 },
+            &mut self.spans,
+        );
+        {
+            let (mut uvq, mut seen) = (&mut self.uvq[..], &mut self.seen[..]);
+            let work = self.spans.iter().map(move |run| {
+                let end = vbase.get(run.end).map_or(n, |&e| e as usize);
+                let len = end - vbase[run.start] as usize;
+                let (a, more) = core::mem::take(&mut uvq).split_at_mut(len);
+                let (b, more2) = core::mem::take(&mut seen).split_at_mut(len);
+                (uvq, seen) = (more, more2);
+                (run.clone(), a, b)
+            });
+            let (rx, ry, rw) = (self.rx, self.ry, self.rw);
+            par::each0(threads, work, |(run, uvq, seen)| {
+                let mut out = uvq.iter_mut().zip(seen.iter_mut());
+                for inst in &frame.instances[run] {
+                    let Some(mesh) = meshes.get(inst.mesh as usize) else {
+                        continue;
+                    };
+                    for p in &mesh.pos {
+                        let (o, s) = out.next().unwrap();
+                        let wp = inst.xf.point(*p);
+                        let w = dot4(&rw, wp);
+                        *s = w > 0.05;
+                        *o = if *s {
+                            let q = 1.0 / w;
+                            [dot4(&rx, wp) * q, dot4(&ry, wp) * q, q]
+                        } else {
+                            [0.0, 0.0, 0.0]
+                        };
+                    }
                 }
-            }
+            });
+        }
+        let (mut ulo, mut uhi, mut vlo, mut vhi) = (1e30f32, -1e30f32, 1e30f32, -1e30f32);
+        for (p, _) in self.uvq.iter().zip(&self.seen).filter(|s| *s.1) {
+            ulo = fmin(ulo, p[0]);
+            uhi = fmax(uhi, p[0]);
+            vlo = fmin(vlo, p[1]);
+            vhi = fmax(vhi, p[1]);
         }
         if !(uhi > ulo) {
             (ulo, uhi, vlo, vhi) = (-0.1, 0.1, -0.1, 0.1);
@@ -169,103 +255,81 @@ impl Light {
         self.v0 = cv - half;
         self.k = key.size * self.itau;
 
-        // Empty what the frame before drew; everything else is empty already.
+        // The faces turned away from the lamp, in texels, filed by the rows
+        // of tiles they may touch.
         let tn = N >> 6;
-        for k in 0..tn * tn {
-            if self.tiles.f[k] != 0 {
-                let (x0, y0) = ((k % tn) << 6, (k / tn) << 6);
-                for y in y0..y0 + 64 {
-                    self.d[y * N + x0..y * N + x0 + 64].fill(0.0);
-                }
+        let window = (self.u0, self.v0, self.itau);
+        if self.spans.len() <= 1 {
+            self.set.reset(tn);
+            let all = 0..frame.instances.len();
+            faces(meshes, frame, vbase, &self.uvq, window, all, &mut self.set);
+        } else {
+            if self.parts.len() < self.spans.len() {
+                self.parts.resize_with(self.spans.len(), Part::default);
             }
+            let parts = &mut self.parts[..self.spans.len()];
+            let uvq = &self.uvq[..];
+            par::each0(
+                threads,
+                parts.iter_mut().zip(self.spans.iter().cloned()),
+                |(p, run)| {
+                    p.set.reset(tn);
+                    faces(meshes, frame, vbase, uvq, window, run, &mut p.set);
+                },
+            );
+            join(parts, &mut Vec::new(), &mut self.set, tn, threads);
         }
-        self.prev.copy_from_slice(&self.tiles.f);
-        self.tiles.reset();
-        let n = N as i32;
-        for (ii, inst) in frame.instances.iter().enumerate() {
-            let Some(mesh) = meshes.get(inst.mesh as usize) else {
-                continue;
-            };
-            let base = vbase[ii] as usize;
-            let nv = mesh.pos.len();
-            for t in mesh.idx.as_chunks::<3>().0 {
-                let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
-                if i0 >= nv || i1 >= nv || i2 >= nv {
-                    continue;
-                }
-                let (a, b, c) = (
-                    self.uvq[base + i0],
-                    self.uvq[base + i1],
-                    self.uvq[base + i2],
-                );
-                if !(a[2] > 0.0 && b[2] > 0.0 && c[2] > 0.0) {
-                    continue;
-                }
-                let (x0, y0) = ((a[0] - self.u0) * self.itau, (a[1] - self.v0) * self.itau);
-                let (x1, y1) = ((b[0] - self.u0) * self.itau, (b[1] - self.v0) * self.itau);
-                let (x2, y2) = ((c[0] - self.u0) * self.itau, (c[1] - self.v0) * self.itau);
-                let (ax, ay, bx, by) = (x1 - x0, y1 - y0, x2 - x0, y2 - y0);
-                let area2 = ax * by - bx * ay;
-                // Faces turned away from the lamp.
-                if !(area2 < 0.0) {
-                    continue;
-                }
-                let inv = 1.0 / area2;
-                let (d1, d2) = (b[2] - a[2], c[2] - a[2]);
-                let dqx = (d1 * by - d2 * ay) * inv;
-                let dqy = (ax * d2 - bx * d1) * inv;
-                scan(
-                    &mut DepthSink {
-                        buf: &mut self.d,
-                        w: N,
-                        tiles: &mut self.tiles,
-                    },
-                    n,
-                    n,
-                    &[(0.5, 0.5)],
-                    &[[x0, y0], [x1, y1], [x2, y2]],
-                    &[x0, y0, a[2], dqx, dqy],
-                );
-            }
-        }
-        self.pyramid();
+
+        // Each row of tiles on its own: emptied of what the frame before
+        // drew there, drawn, and built into the levels above as far as their
+        // tiles are a texel across.
+        let texels = |l: usize| (64 >> l) * (N >> l);
+        let mut d = self.d.chunks_mut(64 * N);
+        let mut marks = self.tiles.f.chunks_mut(tn);
+        let mut prev = self.prev.chunks_mut(tn);
+        let mut qmax = self
+            .qmax
+            .iter_mut()
+            .enumerate()
+            .map(|(i, l)| l.chunks_mut(texels(i + 1)));
+        let mut qmax: [_; BANDED] = core::array::from_fn(|_| qmax.next().unwrap());
+        let mut qmin = self
+            .qmin
+            .iter_mut()
+            .enumerate()
+            .map(|(i, l)| l.chunks_mut(texels(i + 1)));
+        let mut qmin: [_; BANDED] = core::array::from_fn(|_| qmin.next().unwrap());
+        let mut cov = self
+            .cov
+            .iter_mut()
+            .enumerate()
+            .map(|(i, l)| l.chunks_mut(texels(i + 1)));
+        let mut cov: [_; BANDED] = core::array::from_fn(|_| cov.next().unwrap());
+        let mut dec = self
+            .dec
+            .iter_mut()
+            .enumerate()
+            .map(|(i, l)| l.chunks_mut(texels(i + 1)));
+        let mut dec: [_; BANDED] = core::array::from_fn(|_| dec.next().unwrap());
+        let bands = (0..tn).map(move |k| Band {
+            k,
+            d: d.next().unwrap(),
+            marks: marks.next().unwrap(),
+            prev: prev.next().unwrap(),
+            qmax: qmax.each_mut().map(|c| c.next().unwrap()),
+            qmin: qmin.each_mut().map(|c| c.next().unwrap()),
+            cov: cov.each_mut().map(|c| c.next().unwrap()),
+            dec: dec.each_mut().map(|c| c.next().unwrap()),
+        });
+        let set = &self.set;
+        par::each0(threads, bands, |b| band(b, set));
+        self.top();
     }
 
-    fn pyramid(&mut self) {
-        // A tile needs building if it holds something now, or did last frame
-        // and must go back to empty.
-        let tn = N >> 6;
-        for k in 0..tn * tn {
-            self.prev[k] |= self.tiles.f[k];
-        }
-        let n1 = N / 2;
-        {
-            let (mx, mn, cv) = (&mut self.qmax[0], &mut self.qmin[0], &mut self.cov[0]);
-            for k in 0..tn * tn {
-                if self.prev[k] == 0 {
-                    continue;
-                }
-                let (x0, y0) = ((k % tn) * 32, (k / tn) * 32);
-                for y in y0..y0 + 32 {
-                    let (r0, r1) = (
-                        &self.d[2 * y * N..(2 * y + 1) * N],
-                        &self.d[(2 * y + 1) * N..(2 * y + 2) * N],
-                    );
-                    for x in x0..x0 + 32 {
-                        let (a, b, c, d) = (r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]);
-                        let o = y * n1 + x;
-                        mx[o] = fmax(fmax(a, b), fmax(c, d));
-                        mn[o] = fmin(fmin(a, b), fmin(c, d));
-                        let cnt = (a > 0.0) as u32
-                            + (b > 0.0) as u32
-                            + (c > 0.0) as u32
-                            + (d > 0.0) as u32;
-                        cv[o] = [cnt as f32 * 0.25, (a + b + c + d) * 0.25];
-                    }
-                }
-            }
-        }
-        for lv in 1..LEVELS {
+    /// The levels whose tiles are under a texel, built whole from the ones
+    /// below them, and the nearest depth in the map.
+    fn top(&mut self) {
+        for lv in BANDED..LEVELS {
             let n = N >> (lv + 1);
             let (lo, hi) = self.qmax.split_at_mut(lv);
             let (lo2, hi2) = self.qmin.split_at_mut(lv);
@@ -273,41 +337,26 @@ impl Light {
             let (smx, smn, scv) = (&lo[lv - 1], &lo2[lv - 1], &lo3[lv - 1]);
             let (dmx, dmn, dcv) = (&mut hi[0], &mut hi2[0], &mut hi3[0]);
             let sn = n * 2;
-            let ts = 64 >> (lv + 1);
-            let (cells, span) = if ts >= 1 { (tn, ts) } else { (1, n) };
-            for k in 0..cells * cells {
-                if ts >= 1 && self.prev[k] == 0 {
-                    continue;
-                }
-                let (x0, y0) = ((k % cells) * span, (k / cells) * span);
-                for y in y0..y0 + span {
-                    for x in x0..x0 + span {
-                        let (i, o) = (2 * y * sn + 2 * x, y * n + x);
-                        dmx[o] = fmax(fmax(smx[i], smx[i + 1]), fmax(smx[i + sn], smx[i + sn + 1]));
-                        dmn[o] = fmin(fmin(smn[i], smn[i + 1]), fmin(smn[i + sn], smn[i + sn + 1]));
-                        let (a, b, c, d) = (scv[i], scv[i + 1], scv[i + sn], scv[i + sn + 1]);
-                        dcv[o] = [
-                            (a[0] + b[0] + c[0] + d[0]) * 0.25,
-                            (a[1] + b[1] + c[1] + d[1]) * 0.25,
-                        ];
-                    }
+            for y in 0..n {
+                for x in 0..n {
+                    let (i, o) = (2 * y * sn + 2 * x, y * n + x);
+                    dmx[o] = fmax(fmax(smx[i], smx[i + 1]), fmax(smx[i + sn], smx[i + sn + 1]));
+                    dmn[o] = fmin(fmin(smn[i], smn[i + 1]), fmin(smn[i + sn], smn[i + sn + 1]));
+                    let (a, b, c, d) = (scv[i], scv[i + 1], scv[i + sn], scv[i + sn + 1]);
+                    dcv[o] = [
+                        (a[0] + b[0] + c[0] + d[0]) * 0.25,
+                        (a[1] + b[1] + c[1] + d[1]) * 0.25,
+                    ];
                 }
             }
         }
-        for lv in 1..=LEVELS {
-            let (n, ts, half) = (N >> lv, 64 >> lv, 1usize << (lv - 1));
-            let (cells, span) = if ts >= 1 { (tn, ts) } else { (1, n) };
+        for lv in BANDED + 1..=LEVELS {
+            let (n, half) = (N >> lv, 1usize << (lv - 1));
             let dst = &mut self.dec[lv - 1];
-            for k in 0..cells * cells {
-                if ts >= 1 && self.prev[k] == 0 {
-                    continue;
-                }
-                let (x0, y0) = ((k % cells) * span, (k / cells) * span);
-                for y in y0..y0 + span {
-                    let src = &self.d[((y << lv) + half) * N..];
-                    for x in x0..x0 + span {
-                        dst[y * n + x] = src[(x << lv) + half];
-                    }
+            for y in 0..n {
+                let src = &self.d[((y << lv) + half) * N..];
+                for x in 0..n {
+                    dst[y * n + x] = src[(x << lv) + half];
                 }
             }
         }
@@ -543,6 +592,160 @@ impl Light {
 
     pub fn bytes(&self) -> usize {
         let lv: usize = (1..=LEVELS).map(|l| (N >> l) * (N >> l) * 20).sum();
-        N * N * 4 + lv + self.uvq.capacity() * 12
+        N * N * 4 + lv + self.uvq.capacity() * 13 + self.set.bytes()
+    }
+}
+
+/// The faces of the instances of `run` turned away from the lamp, in texels
+/// of the window `(u0, v0, 1 / texel)`, with their depth planes.
+#[allow(clippy::too_many_arguments)]
+fn faces(
+    meshes: &[Mesh],
+    frame: &Frame,
+    vbase: &[u32],
+    uvq: &[[f32; 3]],
+    (u0, v0, itau): (f32, f32, f32),
+    run: Range<usize>,
+    set: &mut Setup,
+) {
+    for (ii, inst) in frame
+        .instances
+        .iter()
+        .enumerate()
+        .take(run.end)
+        .skip(run.start)
+    {
+        let Some(mesh) = meshes.get(inst.mesh as usize) else {
+            continue;
+        };
+        let base = vbase[ii] as usize;
+        let nv = mesh.pos.len();
+        for t in mesh.idx.as_chunks::<3>().0 {
+            let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            if i0 >= nv || i1 >= nv || i2 >= nv {
+                continue;
+            }
+            let (a, b, c) = (uvq[base + i0], uvq[base + i1], uvq[base + i2]);
+            if !(a[2] > 0.0 && b[2] > 0.0 && c[2] > 0.0) {
+                continue;
+            }
+            let (x0, y0) = ((a[0] - u0) * itau, (a[1] - v0) * itau);
+            let (x1, y1) = ((b[0] - u0) * itau, (b[1] - v0) * itau);
+            let (x2, y2) = ((c[0] - u0) * itau, (c[1] - v0) * itau);
+            let (ax, ay, bx, by) = (x1 - x0, y1 - y0, x2 - x0, y2 - y0);
+            let area2 = ax * by - bx * ay;
+            // Faces turned away from the lamp.
+            if !(area2 < 0.0) {
+                continue;
+            }
+            let inv = 1.0 / area2;
+            let (d1, d2) = (b[2] - a[2], c[2] - a[2]);
+            let dqx = (d1 * by - d2 * ay) * inv;
+            let dqy = (ax * d2 - bx * d1) * inv;
+            let pl = [x0, y0, a[2], dqx, dqy];
+            set.add([[x0, y0], [x1, y1], [x2, y2]], pl, N as i32, 6);
+        }
+    }
+}
+
+/// Draws one row of tiles of the map and builds the levels above it, as far
+/// as `BANDED`, from it alone: what `draw` did for those rows when the whole
+/// map was drawn at once.
+fn band(mut b: Band, set: &Setup) {
+    let tn = N >> 6;
+    // Empty what the frame before drew; everything else is empty already.
+    for tx in 0..tn {
+        if b.marks[tx] != 0 {
+            for row in b.d.chunks_mut(N) {
+                row[tx << 6..(tx + 1) << 6].fill(0.0);
+            }
+        }
+    }
+    b.prev.copy_from_slice(&*b.marks);
+    b.marks.fill(0);
+    let y0 = b.k << 6;
+    let mut sink = DepthBand {
+        buf: &mut *b.d,
+        y0,
+        marks: &mut *b.marks,
+    };
+    let rows = (y0 as i32, y0 as i32 + 64);
+    for it in &set.bins[b.k] {
+        scan_edges(&mut sink, N as i32, rows, &[(0.5, 0.5)], &it.e, &it.pl);
+    }
+    // A tile needs building if it holds something now, or did last frame
+    // and must go back to empty.
+    for (p, m) in b.prev.iter_mut().zip(b.marks.iter()) {
+        *p |= *m;
+    }
+    let d = &*b.d;
+    {
+        let n1 = N / 2;
+        let (mx, mn, cv) = (&mut *b.qmax[0], &mut *b.qmin[0], &mut *b.cov[0]);
+        for tx in 0..tn {
+            if b.prev[tx] == 0 {
+                continue;
+            }
+            let x0 = tx * 32;
+            for y in 0..32 {
+                let (r0, r1) = (
+                    &d[2 * y * N..(2 * y + 1) * N],
+                    &d[(2 * y + 1) * N..(2 * y + 2) * N],
+                );
+                for x in x0..x0 + 32 {
+                    let (a, b, c, d) = (r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]);
+                    let o = y * n1 + x;
+                    mx[o] = fmax(fmax(a, b), fmax(c, d));
+                    mn[o] = fmin(fmin(a, b), fmin(c, d));
+                    let cnt =
+                        (a > 0.0) as u32 + (b > 0.0) as u32 + (c > 0.0) as u32 + (d > 0.0) as u32;
+                    cv[o] = [cnt as f32 * 0.25, (a + b + c + d) * 0.25];
+                }
+            }
+        }
+    }
+    for lv in 1..BANDED {
+        let n = N >> (lv + 1);
+        let (lo, hi) = b.qmax.split_at_mut(lv);
+        let (lo2, hi2) = b.qmin.split_at_mut(lv);
+        let (lo3, hi3) = b.cov.split_at_mut(lv);
+        let (smx, smn, scv) = (&*lo[lv - 1], &*lo2[lv - 1], &*lo3[lv - 1]);
+        let (dmx, dmn, dcv) = (&mut *hi[0], &mut *hi2[0], &mut *hi3[0]);
+        let sn = n * 2;
+        let ts = 64 >> (lv + 1);
+        for tx in 0..tn {
+            if b.prev[tx] == 0 {
+                continue;
+            }
+            let x0 = tx * ts;
+            for y in 0..ts {
+                for x in x0..x0 + ts {
+                    let (i, o) = (2 * y * sn + 2 * x, y * n + x);
+                    dmx[o] = fmax(fmax(smx[i], smx[i + 1]), fmax(smx[i + sn], smx[i + sn + 1]));
+                    dmn[o] = fmin(fmin(smn[i], smn[i + 1]), fmin(smn[i + sn], smn[i + sn + 1]));
+                    let (a, b, c, d) = (scv[i], scv[i + 1], scv[i + sn], scv[i + sn + 1]);
+                    dcv[o] = [
+                        (a[0] + b[0] + c[0] + d[0]) * 0.25,
+                        (a[1] + b[1] + c[1] + d[1]) * 0.25,
+                    ];
+                }
+            }
+        }
+    }
+    for lv in 1..=BANDED {
+        let (n, ts, half) = (N >> lv, 64 >> lv, 1usize << (lv - 1));
+        let dst = &mut *b.dec[lv - 1];
+        for tx in 0..tn {
+            if b.prev[tx] == 0 {
+                continue;
+            }
+            let x0 = tx * ts;
+            for y in 0..ts {
+                let src = &d[((y << lv) + half) * N..];
+                for x in x0..x0 + ts {
+                    dst[y * n + x] = src[(x << lv) + half];
+                }
+            }
+        }
     }
 }

@@ -11,9 +11,15 @@
 //! sheen of the lamps, how mirror-like the floor is at that angle, the
 //! backdrop) is worked out at every eighth pixel and blended between. The
 //! shadow and the mirror image are read at every pixel.
+//!
+//! Each step works a band of rows at a time, and a band writes only its own
+//! rows, so the bands may be shared out over threads.
 
 use super::light::{Light, log2ish};
-use super::raster::{Frag, NS, Tiles, Tri, dilate, resolve};
+use super::par;
+use super::raster::{
+    Frag, KeyBand, NS, Pass, Setup, Tiles, Tri, dilate, draw_band, key_bands, resolve_band,
+};
 use super::shade::{Ctx, lamp_spec, shade, sky, surf};
 use super::{clamp01, compress, expose, fmax, fmin};
 use crate::studio::math::V3;
@@ -21,18 +27,27 @@ use crate::studio::scene::Floor;
 
 const G: usize = 8;
 const MLEV: usize = 6;
-const CH: usize = 10;
+/// Values on the floor's coarse grid: lit floor colour, its reflection,
+/// how strongly it mirrors, and the backdrop.
+pub const CH: usize = 10;
+/// Rows of the coarse grid worked out together.
+const GRID_ROWS: usize = 8;
 
 pub struct Mirror {
     pub w: usize,
     pub h: usize,
+    /// Laid out by band, as `raster::KeyBand` says.
     pub keys: Vec<u64>,
     pub tris: Vec<Tri>,
-    /// Tiles of sixteen pixels: one texel of level 4.
+    /// Tiles of sixteen pixels: one texel of level 4. A band of the image
+    /// is one row of them.
     pub tiles: Tiles,
+    /// The triangles of the upside-down view, by band.
+    pub set: Setup,
     /// Whether the frame before left an image here.
     dirty: bool,
-    frags: Vec<Frag>,
+    /// The surfaces of each band.
+    frags: Vec<Vec<Frag>>,
     open: Vec<u8>,
     /// For each of the first five levels, the tiles that may hold something
     /// now, and those that did last frame and must be emptied.
@@ -65,9 +80,10 @@ impl Mirror {
             h,
             keys: vec![0; w * h * NS],
             tris: Vec::new(),
+            frags: (0..tiles.th).map(|_| Vec::new()).collect(),
             tiles,
+            set: Setup::default(),
             dirty: false,
-            frags: Vec::new(),
             open: vec![0; w * h],
             nz: flags.clone(),
             pz: flags,
@@ -80,55 +96,94 @@ impl Mirror {
         }
     }
 
-    /// Shades the upside-down picture and builds its blurred copies. `cx`
-    /// looks from the eye's reflection under the floor; `cent` says where in
-    /// a pixel to shade a surface that owns only some of its samples.
+    /// Shades the upside-down picture already drawn into `keys` and `tiles`
+    /// (a band at a time, by `raster::draw_band`) and builds its blurred
+    /// copies. `cx` looks from the eye's reflection
+    /// under the floor; `cent` says where in a pixel to shade a surface that
+    /// owns only some of its samples.
     pub fn shade(&mut self, cx: &Ctx, cent: &[(f32, f32); 16]) {
-        // Nothing mirrored now and nothing left over: every copy is empty already.
+        self.draw_and_shade(None, cx, cent, 1);
+    }
+
+    /// `shade`, on up to `threads` threads; with `pass`, each band is first
+    /// drawn from the triangles `raster::setup` filed in `set`, with its
+    /// tile marks cleared before.
+    pub fn draw_and_shade(
+        &mut self,
+        pass: Option<&Pass>,
+        cx: &Ctx,
+        cent: &[(f32, f32); 16],
+        threads: usize,
+    ) {
+        let (w, h) = (self.w, self.h);
+        let (tw, th) = (self.tiles.tw, self.tiles.th);
+        // Level 0: each pixel the sum of its surfaces by the share of the
+        // pixel they cover, so edges come out soft.
+        {
+            let (tris, set, pz0) = (&self.tris, &self.set, &self.pz[0]);
+            let rows = w << 4;
+            let mut open = self.open.chunks_mut(rows);
+            let mut frags = self.frags.iter_mut();
+            let mut nz0 = self.nz[0].chunks_mut(tw);
+            let mut l0 = self.lv[0].chunks_mut(rows);
+            let bands = key_bands(&mut self.keys, w, h, &mut self.tiles).map(move |(k, band)| {
+                let (open, frags) = (open.next().unwrap(), frags.next().unwrap());
+                (
+                    k,
+                    band,
+                    open,
+                    frags,
+                    nz0.next().unwrap(),
+                    l0.next().unwrap(),
+                )
+            });
+            par::each0(
+                threads,
+                bands,
+                |(k, mut band, open, frags, nz0, l0): (usize, KeyBand, _, _, _, _)| {
+                    if let Some(pass) = pass {
+                        band.marks.fill(0);
+                        draw_band(pass, 4, set, k, &mut band);
+                    }
+                    frags.clear();
+                    resolve_band(&band, w, 4, tris, frags, open);
+                    nz0.copy_from_slice(&*band.marks);
+                    let pz0 = &pz0[k * tw..(k + 1) * tw];
+                    for tx in 0..tw {
+                        if nz0[tx] | pz0[tx] != 0 {
+                            let (x0, x1) = (tx << 4, ((tx + 1) << 4).min(w));
+                            for row in l0.chunks_mut(w) {
+                                row[x0..x1].fill([0.0; 5]);
+                            }
+                        }
+                    }
+                    let base = band.y0 * w;
+                    for f in frags.iter() {
+                        let t = &tris[f.tri as usize];
+                        let (x, y) = (f.px as usize % w, f.px as usize / w);
+                        let (ox, oy) = cent[(f.bits >> 4) as usize & 15];
+                        let sf = surf(cx, t, x as f32 + ox, y as f32 + oy);
+                        let c = shade(cx, &sf, t, 0.85);
+                        let share = (f.bits & 15) as f32 * (1.0 / NS as f32);
+                        // Keep one glint from swamping the blur.
+                        let k = share / (1.0 + 0.25 * fmax(c[0], fmax(c[1], c[2])));
+                        let o = &mut l0[f.px as usize - base];
+                        o[0] += c[0] * k;
+                        o[1] += c[1] * k;
+                        o[2] += c[2] * k;
+                        o[3] += share;
+                        o[4] += share * fmax(sf.p.y, 0.0);
+                    }
+                },
+            );
+        }
+        // Nothing mirrored now and nothing left over: every copy is empty
+        // already, and level 0 was left as it was.
         let any = self.tiles.f.iter().any(|&f| f != 0);
         if !any && !self.dirty {
             return;
         }
         self.dirty = any;
-        let (w, h) = (self.w, self.h);
-        let (tw, th) = (self.tiles.tw, self.tiles.th);
-        resolve(
-            &self.keys,
-            w,
-            h,
-            &self.tiles,
-            &self.tris,
-            &mut self.frags,
-            &mut self.open,
-        );
-        // Level 0: each pixel the sum of its surfaces by the share of the
-        // pixel they cover, so edges come out soft.
-        self.nz[0].copy_from_slice(&self.tiles.f);
-        let l0 = &mut self.lv[0];
-        for k in 0..tw * th {
-            if self.nz[0][k] | self.pz[0][k] != 0 {
-                let (x0, y0) = ((k % tw) << 4, (k / tw) << 4);
-                for y in y0..(y0 + 16).min(h) {
-                    l0[y * w + x0..y * w + (x0 + 16).min(w)].fill([0.0; 5]);
-                }
-            }
-        }
-        for f in &self.frags {
-            let t = &self.tris[f.tri as usize];
-            let (x, y) = (f.px as usize % w, f.px as usize / w);
-            let (ox, oy) = cent[(f.bits >> 4) as usize & 15];
-            let sf = surf(cx, t, x as f32 + ox, y as f32 + oy);
-            let c = shade(cx, &sf, t, 0.85);
-            let share = (f.bits & 15) as f32 * (1.0 / NS as f32);
-            // Keep one glint from swamping the blur.
-            let k = share / (1.0 + 0.25 * fmax(c[0], fmax(c[1], c[2])));
-            let o = &mut l0[f.px as usize];
-            o[0] += c[0] * k;
-            o[1] += c[1] * k;
-            o[2] += c[2] * k;
-            o[3] += share;
-            o[4] += share * fmax(sf.p.y, 0.0);
-        }
         const K: [f32; 4] = [0.125, 0.375, 0.375, 0.125];
         for l in 1..MLEV {
             if l < 5 {
@@ -139,33 +194,41 @@ impl Mirror {
             let (src, dst) = (&lo[l - 1], &mut hi[0]);
             let ((sw, sh), (dw, dh)) = (self.dims[l - 1], self.dims[l]);
             let ts = 16 >> l;
-            let (cells_x, cells_y, span) = if ts >= 1 {
-                (tw, th, ts)
-            } else {
-                (1, 1, dw.max(dh))
-            };
-            for k in 0..cells_x * cells_y {
-                if ts >= 1 && self.nz[l][k] | self.pz[l][k] == 0 {
-                    continue;
-                }
-                let (x0, y0) = ((k % cells_x) * span, (k / cells_x) * span);
-                for y in y0..(y0 + span).min(dh) {
-                    for x in x0..(x0 + span).min(dw) {
-                        let mut o = [0.0f32; 5];
-                        for (j, kj) in K.iter().enumerate() {
-                            let yy = ((2 * y + j) as i32 - 1).clamp(0, sh as i32 - 1) as usize;
-                            for (i, ki) in K.iter().enumerate() {
-                                let xx = ((2 * x + i) as i32 - 1).clamp(0, sw as i32 - 1) as usize;
-                                let (s, kk) = (&src[yy * sw + xx], kj * ki);
-                                for c in 0..5 {
-                                    o[c] += s[c] * kk;
+            let (cells_x, span) = if ts >= 1 { (tw, ts) } else { (1, dw.max(dh)) };
+            let (nz, pz) = (&self.nz, &self.pz);
+            // A row of cells at a time: a row reads the rows of the level
+            // below it and a row either side, and writes only its own.
+            par::each0(
+                threads,
+                dst.chunks_mut(span * dw).enumerate(),
+                |(cy, rows)| {
+                    for cx_ in 0..cells_x {
+                        let k = cy * cells_x + cx_;
+                        if ts >= 1 && nz[l][k] | pz[l][k] == 0 {
+                            continue;
+                        }
+                        let (x0, y0) = (cx_ * span, cy * span);
+                        for y in y0..(y0 + span).min(dh) {
+                            for x in x0..(x0 + span).min(dw) {
+                                let mut o = [0.0f32; 5];
+                                for (j, kj) in K.iter().enumerate() {
+                                    let yy =
+                                        ((2 * y + j) as i32 - 1).clamp(0, sh as i32 - 1) as usize;
+                                    for (i, ki) in K.iter().enumerate() {
+                                        let xx = ((2 * x + i) as i32 - 1).clamp(0, sw as i32 - 1)
+                                            as usize;
+                                        let (s, kk) = (&src[yy * sw + xx], kj * ki);
+                                        for c in 0..5 {
+                                            o[c] += s[c] * kk;
+                                        }
+                                    }
                                 }
+                                rows[(y - y0) * dw + x] = o;
                             }
                         }
-                        dst[y * dw + x] = o;
                     }
-                }
-            }
+                },
+            );
         }
         core::mem::swap(&mut self.nz, &mut self.pz);
         // Level 3 is read first; it reaches under 20 pixels past the image.
@@ -223,7 +286,8 @@ impl Mirror {
         self.lv.iter().map(|l| l.len() * 20).sum::<usize>()
             + self.keys.len() * 8
             + self.tris.capacity() * core::mem::size_of::<Tri>()
-            + self.frags.capacity() * 12
+            + self.set.bytes()
+            + self.frags.iter().map(|f| f.capacity() * 12).sum::<usize>()
             + self.open.len()
     }
 
@@ -243,15 +307,79 @@ impl Mirror {
         hdr: &mut [[f32; 3]],
         bright: &mut [u8],
     ) {
+        let mut rows = [core::mem::take(&mut self.row)];
+        self.floor_with(
+            cx, fl, w, h, ns, open, tiles, fpx, exposure, hdr, bright, 1, &mut rows,
+        );
+        let [row] = rows;
+        self.row = row;
+    }
+
+    /// `floor` on up to `threads` threads, a row of `tiles` at a time, each
+    /// thread with one of `rows` for scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn floor_with(
+        &mut self,
+        cx: &Ctx,
+        fl: &Floor,
+        w: usize,
+        h: usize,
+        ns: usize,
+        open: &[u8],
+        tiles: &Tiles,
+        fpx: f32,
+        exposure: f32,
+        hdr: &mut [[f32; 3]],
+        bright: &mut [u8],
+        threads: usize,
+        rows: &mut [Vec<[f32; CH]>],
+    ) {
+        self.grid(cx, fl, w, h, threads);
+        let me = &*self;
+        let (n, sh, tw) = (w << tiles.sh, tiles.sh, tiles.tw);
+        let bands = hdr
+            .chunks_mut(n)
+            .zip(open.chunks(n))
+            .zip(tiles.f.chunks(tw).zip(bright.chunks_mut(tw)))
+            .enumerate();
+        par::each(
+            threads,
+            bands,
+            rows,
+            |row, (k, ((hdr, open), (marks, bright)))| {
+                me.floor_rows(
+                    cx,
+                    fl,
+                    w,
+                    h,
+                    ns,
+                    fpx,
+                    exposure,
+                    k << sh,
+                    open,
+                    marks,
+                    sh,
+                    hdr,
+                    bright,
+                    row,
+                );
+            },
+        );
+    }
+
+    /// The slow parts of the floor, on a coarse grid, on up to `threads`
+    /// threads: what `floor_rows` blends between.
+    pub fn grid(&mut self, cx: &Ctx, fl: &Floor, w: usize, h: usize, threads: usize) {
         let (gw, gh) = (w / G + 2, h / G + 2);
         let rough = fmin(fmax(fl.rough, 0.045), 1.0);
         let a = rough * rough;
         let mirror = clamp01(fl.mirror);
         let eye = cx.eye;
-        // The slow parts, on a coarse grid.
-        self.grid.clear();
-        for gy in 0..gh {
-            for gx in 0..gw {
+        self.grid.resize(gw * gh, [0.0; CH]);
+        let rows = self.grid.chunks_mut(gw * GRID_ROWS).enumerate();
+        par::each0(threads, rows, |(k, cells)| {
+            for (i, cell) in cells.iter_mut().enumerate() {
+                let (gx, gy) = (i % gw, k * GRID_ROWS + i / gw);
                 let d = cx.ray0 + cx.rdx * (gx * G) as f32 + cx.rdy * (gy * G) as f32;
                 let il = 1.0 / d.dot(d).sqrt();
                 let mut n = [0.0f32; CH];
@@ -304,9 +432,35 @@ impl Mirror {
                     }
                     n[6] = refl;
                 }
-                self.grid.push(n);
+                *cell = n;
             }
-        }
+        });
+    }
+
+    /// The floor and backdrop of one band of rows, from row `y0`, one row
+    /// of the picture's tiles (`1 << sh` rows) high: `open`, `hdr` are the
+    /// band's rows, `marks` and `bright` its row of tiles. `row` is scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn floor_rows(
+        &self,
+        cx: &Ctx,
+        fl: &Floor,
+        w: usize,
+        h: usize,
+        ns: usize,
+        fpx: f32,
+        exposure: f32,
+        y0: usize,
+        open: &[u8],
+        marks: &[u8],
+        sh: usize,
+        hdr: &mut [[f32; 3]],
+        bright: &mut [u8],
+        row: &mut Vec<[f32; CH]>,
+    ) {
+        let gw = w / G + 2;
+        let rough = fmin(fmax(fl.rough, 0.045), 1.0);
+        let eye = cx.eye;
         let (rx, ry, rw) = cx.light.rows();
         let plane = |r: &[f32; 4]| {
             let e = r[0] * eye.x + r[1] * eye.y + r[2] * eye.z + r[3];
@@ -330,28 +484,28 @@ impl Mirror {
             fl.base[1] * cx.amb[1],
             fl.base[2] * cx.amb[2],
         ];
-        self.row.resize(gw, [0.0; CH]);
+        row.resize(gw, [0.0; CH]);
         const FX: [f32; G] = [
             0.0625, 0.1875, 0.3125, 0.4375, 0.5625, 0.6875, 0.8125, 0.9375,
         ];
         let floor_on = eye.y > 0.0;
-        for y in 0..h {
+        for y in y0..(y0 + (1 << sh)).min(h) {
             let (gy, fy) = (y / G, ((y % G) as f32 + 0.5) / G as f32);
             for gx in 0..gw {
                 let (a, b) = (&self.grid[gy * gw + gx], &self.grid[(gy + 1) * gw + gx]);
                 for k in 0..CH {
-                    self.row[gx][k] = a[k] + (b[k] - a[k]) * fy;
+                    row[gx][k] = a[k] + (b[k] - a[k]) * fy;
                 }
             }
             let yc = y as f32 + 0.5;
-            let trow = (y >> tiles.sh) * tiles.tw;
+            let at = (y - y0) * w;
             let nrow = (y >> 5).min(nh - 1) * nw;
             let mut x0 = 0;
             while x0 < w {
                 let x1 = (x0 + G).min(w);
-                let tk = trow + (x0 >> tiles.sh);
-                let meshes = tiles.f[tk] != 0;
-                let (a, b) = (self.row[x0 / G], self.row[x0 / G + 1]);
+                let tk = x0 >> sh;
+                let meshes = marks[tk] != 0;
+                let (a, b) = (row[x0 / G], row[x0 / G + 1]);
                 let near = self.near[nrow + (x0 >> 5).min(nw - 1)] != 0;
                 if x1 - x0 == G
                     && !near
@@ -366,7 +520,7 @@ impl Mirror {
                     let mut whole = [true; G];
                     if meshes {
                         for j in 0..G {
-                            let n0 = open[y * w + x0 + j] as usize;
+                            let n0 = open[at + x0 + j] as usize;
                             wt[j] = n0 as f32 * inv_ns;
                             whole[j] = n0 == ns;
                         }
@@ -398,7 +552,7 @@ impl Mirror {
                         };
                         top[j] = if done { m * k } else { 0.0 };
                     }
-                    hdr[y * w + x0..y * w + x1].copy_from_slice(&res);
+                    hdr[at + x0..at + x1].copy_from_slice(&res);
                     if top.iter().any(|&t| t > 1.0) {
                         bright[tk] = 1;
                     }
@@ -406,7 +560,7 @@ impl Mirror {
                     continue;
                 }
                 for x in x0..x1 {
-                    let i = y * w + x;
+                    let i = at + x;
                     let n0 = if meshes { open[i] as usize } else { ns };
                     if n0 == 0 {
                         hdr[i] = [0.0; 3];

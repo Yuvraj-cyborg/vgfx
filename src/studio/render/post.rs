@@ -2,9 +2,11 @@
 //! room (ambient occlusion, at half size), and the finish (bloom, exposure,
 //! tone curve, vignette, dither, sRGB).
 
+use super::par;
 use super::raster::{Tiles, Tri, dilate};
 use super::{clamp01, expose, fmax, fmin};
 use crate::studio::math::{TAU, V3, cos, sin};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const TAPS: usize = 10;
 /// How far a surface looks for something that closes it in, in world units.
@@ -66,6 +68,27 @@ impl Ao {
         fpx: f32,
         fq: [f32; 3],
     ) {
+        self.compute_with(keys, fw, tris, tiles, fw, fh, right, up, fwd, fpx, fq, 1);
+    }
+
+    /// `compute` on up to `threads` threads, a row of tiles at a time; the
+    /// result is the same. The key of pixel (x, y) is `keys[y * stride + x]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_with(
+        &mut self,
+        keys: &[u64],
+        stride: usize,
+        tris: &[Tri],
+        tiles: &Tiles,
+        fw: usize,
+        fh: usize,
+        right: V3,
+        up: V3,
+        fwd: V3,
+        fpx: f32,
+        fq: [f32; 3],
+        threads: usize,
+    ) {
         const ORDER: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
         if !tiles.f.iter().any(|&f| f != 0) {
             return;
@@ -75,129 +98,129 @@ impl Ao {
         dilate(&tiles.f, tw, th, 4, &mut self.ms, &mut self.m4);
         dilate(&tiles.f, tw, th, 2, &mut self.ms, &mut self.m2);
         dilate(&tiles.f, tw, th, 1, &mut self.ms, &mut self.m1);
+        // A row of tiles is sixteen rows here; `rows` of the buffers.
+        let rows = w << 4;
         let span = |t: usize, n: usize| (t << 4)..((t + 1) << 4).min(n);
-        for (ty, tx) in (0..th).flat_map(|ty| (0..tw).map(move |tx| (ty, tx))) {
-            if self.m4[ty * tw + tx] == 0 {
-                continue;
-            }
-            for j in span(ty, h) {
-                let y = (2 * j).min(fh - 1);
-                for i in span(tx, w) {
-                    let x = (2 * i).min(fw - 1);
-                    let k = if tiles.f[(y >> 5) * tw + (x >> 5)] != 0 {
-                        keys[y * fw + x]
-                    } else {
-                        0
-                    };
-                    let o = j * w + i;
-                    if k as u32 != 0 {
-                        self.z[o] = 1.0 / f32::from_bits((k >> 32) as u32);
-                    } else {
-                        let q = fq[0] + fq[1] * (x as f32 + 0.375) + fq[2] * (y as f32 + 0.125);
-                        self.z[o] = if q > 1e-6 { 1.0 / q } else { 1e6 };
-                        self.tmp[o] = 1.0;
-                    }
+        // Depth: what each point is, from the picture's keys.
+        let m4 = &self.m4;
+        let bands = self
+            .z
+            .chunks_mut(rows)
+            .zip(self.tmp.chunks_mut(rows))
+            .enumerate();
+        par::each0(threads, bands, |(ty, (z, tmp))| {
+            for tx in 0..tw {
+                if m4[ty * tw + tx] == 0 {
+                    continue;
                 }
-            }
-        }
-        let inv_f = 1.0 / fpx;
-        let (cx, cy) = (fw as f32 * 0.5 - 0.375, fh as f32 * 0.5 - 0.125);
-        for (ty, tx) in (0..th).flat_map(|ty| (0..tw).map(move |tx| (ty, tx))) {
-            if tiles.f[ty * tw + tx] == 0 {
-                continue;
-            }
-            for j in span(ty, h) {
-                let y = (2 * j).min(fh - 1);
-                for i in span(tx, w) {
-                    let x = (2 * i).min(fw - 1);
-                    let o = j * w + i;
-                    let id = keys[y * fw + x] as u32;
-                    if id == 0 {
-                        continue;
-                    }
-                    let ng = tris[id as usize - 1].ng;
-                    let n = V3 {
-                        x: ng.dot(right),
-                        y: -ng.dot(up),
-                        z: ng.dot(fwd),
-                    };
-                    let z = self.z[o];
-                    let p = V3 {
-                        x: (x as f32 - cx) * inv_f * z,
-                        y: (y as f32 - cy) * inv_f * z,
-                        z,
-                    };
-                    let rp = fmin(fmax(REACH * fpx * 0.5 / z, 2.0), 48.0);
-                    let taps = &self.taps[ORDER[(j & 3) * 4 + (i & 3)] as usize];
-                    let bias = 0.012 * z;
-                    let mut occ = 0.0f32;
-                    for &(tx, ty) in taps {
-                        let ti =
-                            ((i as f32 + tx * rp + 0.5) as i32).clamp(0, w as i32 - 1) as usize;
-                        let tj =
-                            ((j as f32 + ty * rp + 0.5) as i32).clamp(0, h as i32 - 1) as usize;
-                        let zt = self.z[tj * w + ti];
-                        let v = V3 {
-                            x: ((2 * ti) as f32 - cx) * inv_f * zt,
-                            y: ((2 * tj) as f32 - cy) * inv_f * zt,
-                            z: zt,
-                        } - p;
-                        let vv = v.dot(v);
-                        let vn = v.dot(n) - bias;
-                        if vn > 0.0 && vv < REACH * REACH {
-                            let f = 1.0 - vv * (1.0 / (REACH * REACH));
-                            occ += vn / (vv + 1e-4) * f * f;
+                for j in span(ty, h) {
+                    let y = (2 * j).min(fh - 1);
+                    for i in span(tx, w) {
+                        let x = (2 * i).min(fw - 1);
+                        let k = if tiles.f[(y >> 5) * tw + (x >> 5)] != 0 {
+                            keys[y * stride + x]
+                        } else {
+                            0
+                        };
+                        let o = (j - (ty << 4)) * w + i;
+                        if k as u32 != 0 {
+                            z[o] = 1.0 / f32::from_bits((k >> 32) as u32);
+                        } else {
+                            let q = fq[0] + fq[1] * (x as f32 + 0.375) + fq[2] * (y as f32 + 0.125);
+                            z[o] = if q > 1e-6 { 1.0 / q } else { 1e6 };
+                            tmp[o] = 1.0;
                         }
                     }
-                    self.tmp[o] = occ * (REACH * 1.1 / TAPS as f32);
                 }
             }
-        }
-        for pass in 0..2 {
-            let (src, dst, step, mask) = if pass == 0 {
-                (&self.tmp, &mut self.ao, 1, &self.m2)
-            } else {
-                (&self.ao, &mut self.tmp, w, &self.m1)
-            };
-            let lim = if pass == 0 { w } else { h };
-            for (ty, tx) in (0..th).flat_map(|ty| (0..tw).map(move |tx| (ty, tx))) {
-                if mask[ty * tw + tx] == 0 {
+        });
+        // How closed in each point is, then that blurred along the row.
+        let inv_f = 1.0 / fpx;
+        let (cx, cy) = (fw as f32 * 0.5 - 0.375, fh as f32 * 0.5 - 0.125);
+        let (zs, taps, m2) = (&self.z[..], &self.taps, &self.m2);
+        let bands = self
+            .tmp
+            .chunks_mut(rows)
+            .zip(self.ao.chunks_mut(rows))
+            .enumerate();
+        par::each0(threads, bands, |(ty, (tmp, ao))| {
+            let base = (ty << 4) * w;
+            for tx in 0..tw {
+                if tiles.f[ty * tw + tx] == 0 {
+                    continue;
+                }
+                for j in span(ty, h) {
+                    let y = (2 * j).min(fh - 1);
+                    for i in span(tx, w) {
+                        let x = (2 * i).min(fw - 1);
+                        let o = j * w + i;
+                        let id = keys[y * stride + x] as u32;
+                        if id == 0 {
+                            continue;
+                        }
+                        let ng = tris[id as usize - 1].ng;
+                        let n = V3 {
+                            x: ng.dot(right),
+                            y: -ng.dot(up),
+                            z: ng.dot(fwd),
+                        };
+                        let z = zs[o];
+                        let p = V3 {
+                            x: (x as f32 - cx) * inv_f * z,
+                            y: (y as f32 - cy) * inv_f * z,
+                            z,
+                        };
+                        let rp = fmin(fmax(REACH * fpx * 0.5 / z, 2.0), 48.0);
+                        let taps = &taps[ORDER[(j & 3) * 4 + (i & 3)] as usize];
+                        let bias = 0.012 * z;
+                        let mut occ = 0.0f32;
+                        for &(tx, ty) in taps {
+                            let ti =
+                                ((i as f32 + tx * rp + 0.5) as i32).clamp(0, w as i32 - 1) as usize;
+                            let tj =
+                                ((j as f32 + ty * rp + 0.5) as i32).clamp(0, h as i32 - 1) as usize;
+                            let zt = zs[tj * w + ti];
+                            let v = V3 {
+                                x: ((2 * ti) as f32 - cx) * inv_f * zt,
+                                y: ((2 * tj) as f32 - cy) * inv_f * zt,
+                                z: zt,
+                            } - p;
+                            let vv = v.dot(v);
+                            let vn = v.dot(n) - bias;
+                            if vn > 0.0 && vv < REACH * REACH {
+                                let f = 1.0 - vv * (1.0 / (REACH * REACH));
+                                occ += vn / (vv + 1e-4) * f * f;
+                            }
+                        }
+                        tmp[o - base] = occ * (REACH * 1.1 / TAPS as f32);
+                    }
+                }
+            }
+            blur(tmp, base, ao, base, zs, ty, tw, w, h, 1, m2);
+        });
+        // Blurred down the columns, from `ao` back into `tmp`: a band reads
+        // two rows either side of its own.
+        let (aos, m1) = (&self.ao[..], &self.m1);
+        let bands = self.tmp.chunks_mut(rows).enumerate();
+        par::each0(threads, bands, |(ty, tmp)| {
+            blur(aos, 0, tmp, (ty << 4) * w, zs, ty, tw, w, h, w, m1);
+        });
+        let tmps = &self.tmp[..];
+        par::each0(threads, self.ao.chunks_mut(rows).enumerate(), |(ty, ao)| {
+            let base = (ty << 4) * w;
+            for tx in 0..tw {
+                if m1[ty * tw + tx] == 0 {
                     continue;
                 }
                 for j in span(ty, h) {
                     for i in span(tx, w) {
                         let o = j * w + i;
-                        let z = self.z[o];
-                        let at = if pass == 0 { i } else { j };
-                        let iz = 12.0 / z;
-                        let (mut s, mut ws) = (0.0f32, 0.0f32);
-                        for (k, wk) in [1.0f32, 2.0, 2.0, 2.0, 1.0].iter().enumerate() {
-                            let a = at + k;
-                            if a < 2 || a >= lim + 2 {
-                                continue;
-                            }
-                            let oo = o + k * step - 2 * step;
-                            let wt = wk * fmax(1.0 - (self.z[oo] - z).abs() * iz, 0.0);
-                            s += src[oo] * wt;
-                            ws += wt;
-                        }
-                        dst[o] = s / fmax(ws, 1e-6);
+                        let a = clamp01(1.0 - tmps[o]);
+                        ao[o - base] = a * a * (3.0 - 2.0 * a) * 0.5 + a * 0.5;
                     }
                 }
             }
-        }
-        for (ty, tx) in (0..th).flat_map(|ty| (0..tw).map(move |tx| (ty, tx))) {
-            if self.m1[ty * tw + tx] == 0 {
-                continue;
-            }
-            for j in span(ty, h) {
-                for i in span(tx, w) {
-                    let o = j * w + i;
-                    let a = clamp01(1.0 - self.tmp[o]);
-                    self.ao[o] = a * a * (3.0 - 2.0 * a) * 0.5 + a * 0.5;
-                }
-            }
-        }
+        });
     }
 
     #[inline(always)]
@@ -219,6 +242,53 @@ impl Ao {
             ws += wt;
         }
         s / ws
+    }
+}
+
+/// One pass of the depth-aware blur, over the tiles of row `ty` marked in
+/// `mask`: along the rows when `step` is 1, down the columns when it is `w`.
+/// `src` holds the picture from index `sbase` on, `dst` the band's rows from
+/// `dbase`.
+#[allow(clippy::too_many_arguments)]
+fn blur(
+    src: &[f32],
+    sbase: usize,
+    dst: &mut [f32],
+    dbase: usize,
+    z: &[f32],
+    ty: usize,
+    tw: usize,
+    w: usize,
+    h: usize,
+    step: usize,
+    mask: &[u8],
+) {
+    let span = |t: usize, n: usize| (t << 4)..((t + 1) << 4).min(n);
+    let lim = if step == 1 { w } else { h };
+    for tx in 0..tw {
+        if mask[ty * tw + tx] == 0 {
+            continue;
+        }
+        for j in span(ty, h) {
+            for i in span(tx, w) {
+                let o = j * w + i;
+                let zo = z[o];
+                let at = if step == 1 { i } else { j };
+                let iz = 12.0 / zo;
+                let (mut s, mut ws) = (0.0f32, 0.0f32);
+                for (k, wk) in [1.0f32, 2.0, 2.0, 2.0, 1.0].iter().enumerate() {
+                    let a = at + k;
+                    if a < 2 || a >= lim + 2 {
+                        continue;
+                    }
+                    let oo = o + k * step - 2 * step;
+                    let wt = wk * fmax(1.0 - (z[oo] - zo).abs() * iz, 0.0);
+                    s += src[oo - sbase] * wt;
+                    ws += wt;
+                }
+                dst[o - dbase] = s / fmax(ws, 1e-6);
+            }
+        }
     }
 }
 
@@ -282,6 +352,8 @@ impl Post {
             + self.lut.len() * 4
     }
 
+    /// The whole finish, on one thread: `gather` every band, `spread` the
+    /// bloom if there is any, `tone` every band.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &mut self,
@@ -296,118 +368,192 @@ impl Post {
         ns: usize,
         out: &mut [u8],
     ) {
+        let has_bloom = self.gather_all(hdr, w, exposure, bloom, open, tiles, bright, ns, 1);
+        if has_bloom {
+            self.spread(bloom, 1);
+        }
+        self.columns(w, h);
+        let mut rows = [core::mem::take(&mut self.rows)];
+        self.tone_all(hdr, w, h, tiles.sh, has_bloom, out, 1, &mut rows);
+        let [rows] = rows;
+        self.rows = rows;
+    }
+
+    /// `gather` for every band of rows (one row of `tiles` high), on up to
+    /// `threads` threads. Says whether anything was bright.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_all(
+        &mut self,
+        hdr: &mut [[f32; 3]],
+        w: usize,
+        exposure: f32,
+        bloom: f32,
+        open: &[u8],
+        tiles: &Tiles,
+        bright: &[u8],
+        ns: usize,
+        threads: usize,
+    ) -> bool {
+        let (bw, sh) = (self.dims[0].0, tiles.sh);
+        let rows = w << sh;
+        let any = AtomicBool::new(false);
+        let bands = hdr
+            .chunks_mut(rows)
+            .zip(open.chunks(rows))
+            .zip(tiles.f.chunks(tiles.tw).zip(bright.chunks(tiles.tw)))
+            .zip(self.bl[0].chunks_mut(bw << (sh - 2)))
+            .enumerate();
+        par::each0(
+            threads,
+            bands,
+            |(k, (((hdr, open), (marks, bright)), b0))| {
+                if gather(
+                    hdr,
+                    k << sh,
+                    w,
+                    exposure,
+                    bloom,
+                    open,
+                    marks,
+                    bright,
+                    sh,
+                    ns,
+                    b0,
+                    bw,
+                ) {
+                    any.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        any.into_inner()
+    }
+
+    /// `tone` for every band of `1 << sh` rows, on up to `threads` threads,
+    /// each with one of `rows` for scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tone_all(
+        &self,
+        hdr: &[[f32; 3]],
+        w: usize,
+        h: usize,
+        sh: usize,
+        has_bloom: bool,
+        out: &mut [u8],
+        threads: usize,
+        rows: &mut [Vec<[f32; 3]>],
+    ) {
+        let n = w << sh;
+        let bands = hdr.chunks(n).zip(out.chunks_mut(n * 3)).enumerate();
+        par::each(threads, bands, rows, |rows, (k, (hdr, out))| {
+            self.tone(hdr, k << sh, w, h, has_bloom, out, rows);
+        });
+    }
+
+    /// Spreads what `gather` found bright over the levels of the bloom, the
+    /// larger levels on up to `threads` threads, some rows to each.
+    pub fn spread(&mut self, bloom: f32, threads: usize) {
+        const ROWS: usize = 8;
         let bloom = clamp01(bloom);
         let (bw, bh) = self.dims[0];
-        let (tw, sh) = (tiles.tw, tiles.sh);
-        for (y, tx) in (0..h).flat_map(|y| (0..tw).map(move |tx| (y, tx))) {
-            if tiles.f[(y >> sh) * tw + tx] == 0 {
-                continue;
-            }
-            for i in y * w + (tx << sh)..y * w + ((tx + 1) << sh).min(w) {
-                if open[i] as usize != ns {
-                    hdr[i] = expose(hdr[i], exposure);
-                }
-            }
+        // Only a level this large is worth sharing out.
+        let share = |(w, h): (usize, usize)| if w * h >= 1 << 15 { threads } else { 1 };
+        for l in 1..BLEV {
+            let (lo, hi) = self.bl.split_at_mut(l);
+            let (src, sd, dd) = (&lo[l - 1][..], self.dims[l - 1], self.dims[l]);
+            let pieces = hi[0].chunks_mut(dd.0 * ROWS).enumerate();
+            par::each0(share(dd), pieces, |(k, rows)| {
+                down(src, sd, rows, dd, k * ROWS)
+            });
         }
-        let mut has_bloom = false;
-        if bloom > 0.0 && bright.iter().any(|&f| f != 0) {
-            self.bl[0].fill([0.0; 3]);
-            for y in 0..h {
-                let brow = &mut self.bl[0][(y / 4) * bw..(y / 4 + 1) * bw];
-                for tx in 0..tw {
-                    if bright[(y >> sh) * tw + tx] == 0 {
-                        continue;
-                    }
-                    for x in (tx << sh)..((tx + 1) << sh).min(w) {
-                        let c = hdr[y * w + x];
-                        let b = fmax(c[0], fmax(c[1], c[2]));
-                        if b > 1.0 {
-                            let t = fmin((b - 1.0) * 0.5, 1.0) * fmin(1.0, 5.0 / b);
-                            let o = &mut brow[x / 4];
-                            o[0] += c[0] * t;
-                            o[1] += c[1] * t;
-                            o[2] += c[2] * t;
-                            has_bloom = true;
-                        }
-                    }
-                }
-            }
+        let spread = 0.45 + 0.75 * bloom;
+        let mut wt = [0.0f32; BLEV];
+        let (mut k, mut sum) = (1.0f32, 0.0f32);
+        for w in wt.iter_mut() {
+            *w = k;
+            sum += k;
+            k *= spread;
         }
-        if has_bloom {
-            for l in 1..BLEV {
-                let (lo, hi) = self.bl.split_at_mut(l);
-                down(&lo[l - 1], self.dims[l - 1], &mut hi[0], self.dims[l]);
-            }
-            let spread = 0.45 + 0.75 * bloom;
-            let mut wt = [0.0f32; BLEV];
-            let (mut k, mut sum) = (1.0f32, 0.0f32);
-            for w in wt.iter_mut() {
-                *w = k;
-                sum += k;
-                k *= spread;
-            }
-            let gain = (0.05 + 0.35 * bloom) / (16.0 * sum);
-            for l in (0..BLEV - 1).rev() {
-                let (lo, hi) = self.bl.split_at_mut(l + 1);
-                let (dst, src) = (&mut lo[l], &hi[0]);
-                let ((dw, dh), (sw, sh)) = (self.dims[l], self.dims[l + 1]);
-                let top = if l == BLEV - 2 { wt[BLEV - 1] } else { 1.0 };
-                for y in 0..dh {
+        let gain = (0.05 + 0.35 * bloom) / (16.0 * sum);
+        for l in (0..BLEV - 1).rev() {
+            let (lo, hi) = self.bl.split_at_mut(l + 1);
+            let (dst, src) = (&mut lo[l], &hi[0][..]);
+            let ((dw, dh), (sw, sh)) = (self.dims[l], self.dims[l + 1]);
+            let top = if l == BLEV - 2 { wt[BLEV - 1] } else { 1.0 };
+            let wl = wt[l];
+            let pieces = dst.chunks_mut(dw * ROWS).enumerate();
+            par::each0(share((dw, dh)), pieces, |(k, rows)| {
+                for (yl, drow) in rows.chunks_mut(dw).enumerate() {
+                    let y = k * ROWS + yl;
                     let fy = y as f32 * 0.5 - 0.25;
                     let (y0, ty) = (fy.floor(), fy - fy.floor());
                     let (ya, yb) = (
                         (y0 as i32).clamp(0, sh as i32 - 1) as usize,
                         (y0 as i32 + 1).clamp(0, sh as i32 - 1) as usize,
                     );
-                    for x in 0..dw {
+                    for (x, d) in drow.iter_mut().enumerate() {
                         let fx = x as f32 * 0.5 - 0.25;
                         let (x0, tx) = (fx.floor(), fx - fx.floor());
                         let (xa, xb) = (
                             (x0 as i32).clamp(0, sw as i32 - 1) as usize,
                             (x0 as i32 + 1).clamp(0, sw as i32 - 1) as usize,
                         );
-                        let d = &mut dst[y * dw + x];
                         for c in 0..3 {
                             let a = src[ya * sw + xa][c]
                                 + (src[ya * sw + xb][c] - src[ya * sw + xa][c]) * tx;
                             let b = src[yb * sw + xa][c]
                                 + (src[yb * sw + xb][c] - src[yb * sw + xa][c]) * tx;
-                            d[c] = d[c] * wt[l] + (a + (b - a) * ty) * top;
+                            d[c] = d[c] * wl + (a + (b - a) * ty) * top;
                         }
                     }
                 }
-            }
-            let b0 = &mut self.bl[0];
-            for y in 0..bh {
-                for x in 0..bw {
-                    let (l, r) = (x.saturating_sub(1), (x + 1).min(bw - 1));
-                    for c in 0..3 {
-                        self.tmp[y * bw + x][c] =
-                            (b0[y * bw + l][c] + 2.0 * b0[y * bw + x][c] + b0[y * bw + r][c])
-                                * 0.25;
-                    }
-                }
-            }
-            for y in 0..bh {
-                let (u, d) = (y.saturating_sub(1), (y + 1).min(bh - 1));
-                for x in 0..bw {
-                    for c in 0..3 {
-                        b0[y * bw + x][c] = (self.tmp[u * bw + x][c]
-                            + 2.0 * self.tmp[y * bw + x][c]
-                            + self.tmp[d * bw + x][c])
-                            * 0.25
-                            * gain;
-                    }
-                }
-            }
+            });
         }
-        const BAYER: [f32; 16] = [
-            0., 8., 2., 10., 12., 4., 14., 6., 3., 11., 1., 9., 15., 7., 13., 5.,
-        ];
-        let b0 = &self.bl[0];
-        let lut = &self.lut[..];
-        let (iw, ih) = (2.0 / w as f32, 2.0 / h as f32);
-        let us = NLUT as f32 / UMAX;
+        let n = share((bw, bh));
+        let b0 = &self.bl[0][..];
+        par::each0(
+            n,
+            self.tmp.chunks_mut(bw * ROWS).enumerate(),
+            |(k, rows)| {
+                for (yl, trow) in rows.chunks_mut(bw).enumerate() {
+                    let y = k * ROWS + yl;
+                    for (x, t) in trow.iter_mut().enumerate() {
+                        let (l, r) = (x.saturating_sub(1), (x + 1).min(bw - 1));
+                        for c in 0..3 {
+                            t[c] =
+                                (b0[y * bw + l][c] + 2.0 * b0[y * bw + x][c] + b0[y * bw + r][c])
+                                    * 0.25;
+                        }
+                    }
+                }
+            },
+        );
+        let tmp = &self.tmp[..];
+        par::each0(
+            n,
+            self.bl[0].chunks_mut(bw * ROWS).enumerate(),
+            |(k, rows)| {
+                for (yl, brow) in rows.chunks_mut(bw).enumerate() {
+                    let y = k * ROWS + yl;
+                    let (u, d) = (y.saturating_sub(1), (y + 1).min(bh - 1));
+                    for (x, b) in brow.iter_mut().enumerate() {
+                        for c in 0..3 {
+                            b[c] = (tmp[u * bw + x][c]
+                                + 2.0 * tmp[y * bw + x][c]
+                                + tmp[d * bw + x][c])
+                                * 0.25
+                                * gain;
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Where each column of the picture reads the bloom, and its share of
+    /// the vignette: what `tone` needs, worked out once a frame.
+    pub fn columns(&mut self, w: usize, _h: usize) {
+        let bw = self.dims[0].0;
+        let iw = 2.0 / w as f32;
         self.cols.clear();
         for x in 0..w {
             let fx = (x as f32 + 0.5) * 0.25 - 0.5;
@@ -419,11 +565,36 @@ impl Post {
             let ux = (x as f32 + 0.5) * iw - 1.0;
             self.cols.push((xa as u32, xb as u32, tx, ux * ux * 0.8));
         }
-        self.rows.resize(3 * w, [0.0; 3]);
-        let (ra, rest) = self.rows.split_at_mut(w);
+    }
+
+    /// Bloom, vignette, tone curve, dither and sRGB for the rows of `hdr`,
+    /// which start at row `y0`, into the same rows of `out`. `rows` is
+    /// scratch. After `columns` (and `spread`, when there is bloom).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tone(
+        &self,
+        hdr: &[[f32; 3]],
+        y0: usize,
+        w: usize,
+        h: usize,
+        has_bloom: bool,
+        out: &mut [u8],
+        rows: &mut Vec<[f32; 3]>,
+    ) {
+        const BAYER: [f32; 16] = [
+            0., 8., 2., 10., 12., 4., 14., 6., 3., 11., 1., 9., 15., 7., 13., 5.,
+        ];
+        let (bw, bh) = self.dims[0];
+        let b0 = &self.bl[0];
+        let lut = &self.lut[..];
+        let ih = 2.0 / h as f32;
+        let us = NLUT as f32 / UMAX;
+        rows.resize(3 * w, [0.0; 3]);
+        let (ra, rest) = rows.split_at_mut(w);
         let (rb, ru) = rest.split_at_mut(w);
         let mut held = (usize::MAX, usize::MAX);
-        for y in 0..h {
+        for (yl, src) in hdr.chunks(w).enumerate() {
+            let y = y0 + yl;
             let fy = (y as f32 + 0.5) * 0.25 - 0.5;
             let (y0, ty) = (fy.floor(), fy - fy.floor());
             let (ya, yb) = (
@@ -442,7 +613,6 @@ impl Post {
                     }
                 }
             }
-            let src = &hdr[y * w..(y + 1) * w];
             for x in 0..w {
                 let mut c = src[x];
                 if has_bloom {
@@ -455,7 +625,7 @@ impl Post {
                     ru[x][k] = fmin(fmax(c[k] * vig, 0.0).sqrt() * us, NLUT as f32);
                 }
             }
-            let orow = &mut out[y * w * 3..(y + 1) * w * 3];
+            let orow = &mut out[yl * w * 3..(yl + 1) * w * 3];
             for (x, (u3, o)) in ru.iter().zip(orow.as_chunks_mut::<3>().0).enumerate() {
                 let dith = (BAYER[(y & 3) * 4 + (x & 3)] + 0.5) * (1.0 / 16.0);
                 for k in 0..3 {
@@ -469,14 +639,72 @@ impl Post {
     }
 }
 
+/// The first part of the finish for one band of rows, from row `y0` and one
+/// row of tiles (`1 << sh` rows) high: surfaces' pixels exposed, and what is
+/// bright enough to bloom gathered into `b0`, the band's rows of the
+/// quarter-size picture, `bw` across. `open` and `hdr` are the band's rows,
+/// `marks` and `bright` its row of tiles. Says whether anything was bright.
+#[allow(clippy::too_many_arguments)]
+pub fn gather(
+    hdr: &mut [[f32; 3]],
+    y0: usize,
+    w: usize,
+    exposure: f32,
+    bloom: f32,
+    open: &[u8],
+    marks: &[u8],
+    bright: &[u8],
+    sh: usize,
+    ns: usize,
+    b0: &mut [[f32; 3]],
+    bw: usize,
+) -> bool {
+    for (row, open) in hdr.chunks_mut(w).zip(open.chunks(w)) {
+        for (tx, _) in marks.iter().enumerate().filter(|m| *m.1 != 0) {
+            for x in (tx << sh)..((tx + 1) << sh).min(w) {
+                if open[x] as usize != ns {
+                    row[x] = expose(row[x], exposure);
+                }
+            }
+        }
+    }
+    let mut has_bloom = false;
+    if clamp01(bloom) > 0.0 {
+        b0.fill([0.0; 3]);
+        for (yl, row) in hdr.chunks(w).enumerate() {
+            let by = (y0 + yl) / 4 - y0 / 4;
+            let brow = &mut b0[by * bw..(by + 1) * bw];
+            for (tx, _) in bright.iter().enumerate().filter(|m| *m.1 != 0) {
+                for x in (tx << sh)..((tx + 1) << sh).min(w) {
+                    let c = row[x];
+                    let b = fmax(c[0], fmax(c[1], c[2]));
+                    if b > 1.0 {
+                        let t = fmin((b - 1.0) * 0.5, 1.0) * fmin(1.0, 5.0 / b);
+                        let o = &mut brow[x / 4];
+                        o[0] += c[0] * t;
+                        o[1] += c[1] * t;
+                        o[2] += c[2] * t;
+                        has_bloom = true;
+                    }
+                }
+            }
+        }
+    }
+    has_bloom
+}
+
+/// Rows of a level from the level below it, from row `y0`: `dst` holds
+/// those rows of a level `dw` across.
 fn down(
     src: &[[f32; 3]],
     (sw, sh): (usize, usize),
     dst: &mut [[f32; 3]],
-    (dw, dh): (usize, usize),
+    (dw, _dh): (usize, usize),
+    y0: usize,
 ) {
     const K: [f32; 4] = [0.125, 0.375, 0.375, 0.125];
-    for y in 0..dh {
+    for (yl, row) in dst.chunks_mut(dw).enumerate() {
+        let y = y0 + yl;
         for x in 0..dw {
             let mut o = [0.0f32; 3];
             for (j, kj) in K.iter().enumerate() {
@@ -489,7 +717,7 @@ fn down(
                     o[2] += s[2] * k;
                 }
             }
-            dst[y * dw + x] = o;
+            row[x] = o;
         }
     }
 }

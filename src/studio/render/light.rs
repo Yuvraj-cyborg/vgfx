@@ -322,7 +322,7 @@ impl Light {
             dec: dec.each_mut().map(|c| c.next().unwrap()),
         });
         let set = &self.set;
-        par::each0(threads, bands, |b| band(b, set));
+        par::each0_by_cost(threads, bands, |b| set.bins[b.k].len(), |b| band(b, set));
         self.top();
     }
 

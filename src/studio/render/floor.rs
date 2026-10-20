@@ -137,9 +137,10 @@ impl Mirror {
                     l0.next().unwrap(),
                 )
             });
-            par::each0(
+            par::each0_by_cost(
                 threads,
                 bands,
+                |b| set.bins[b.0].len(),
                 |(k, mut band, open, frags, nz0, l0): (usize, KeyBand, _, _, _, _)| {
                     if let Some(pass) = pass {
                         band.marks.fill(0);
@@ -342,10 +343,34 @@ impl Mirror {
             .zip(open.chunks(n))
             .zip(tiles.f.chunks(tw).zip(bright.chunks_mut(tw)))
             .enumerate();
-        par::each(
+        // The dearest bands first: those in the lamp's pool, where the
+        // shadow is read, and near the mirror image.
+        let (gw, (nw, nh)) = (w / G + 2, me.dims[4]);
+        let cost = |k: usize| {
+            let (y0, y1) = (k << sh, ((k + 1) << sh).min(h));
+            let lit: usize = (y0 / G..=(y1 - 1) / G + 1)
+                .map(|gy| {
+                    me.grid[gy * gw..(gy + 1) * gw]
+                        .iter()
+                        .filter(|g| g[0] + g[1] + g[2] > 0.0)
+                        .count()
+                })
+                .sum();
+            let near: usize = ((y0 >> 5)..=((y1 - 1) >> 5))
+                .map(|r| {
+                    me.near[r.min(nh - 1) * nw..][..nw]
+                        .iter()
+                        .filter(|&&f| f != 0)
+                        .count()
+                })
+                .sum();
+            lit + 8 * near
+        };
+        par::each_by_cost(
             threads,
             bands,
             rows,
+            |b| cost(b.0),
             |row, (k, ((hdr, open), (marks, bright)))| {
                 me.floor_rows(
                     cx,

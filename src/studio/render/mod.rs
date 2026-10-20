@@ -361,7 +361,9 @@ impl Renderer {
             let mut frags = self.frags.iter_mut();
             let bands = raster::key_bands(&mut self.keys, w, h, &mut self.tiles)
                 .map(move |(k, band)| (k, band, open.next().unwrap(), frags.next().unwrap()));
-            par::each0(threads, bands, |(k, mut band, open, frags)| {
+            // The bands with the most triangles first.
+            let cost = |b: &(usize, _, _, _)| set.bins[b.0].len();
+            par::each0_by_cost(threads, bands, cost, |(k, mut band, open, frags)| {
                 band.marks.fill(0);
                 raster::draw_band(&pass, sh, set, k, &mut band);
                 frags.clear();
@@ -490,7 +492,8 @@ impl Renderer {
         {
             let (tris, cent, ao) = (&self.tris, &self.cent, &self.ao);
             let bands = self.hdr.chunks_mut(w << sh).zip(&self.frags).enumerate();
-            par::each0(threads, bands, |(k, (hdr, frags))| {
+            let cost = |b: &(usize, (_, &Vec<Frag>))| b.1.1.len();
+            par::each0_by_cost(threads, bands, cost, |(k, (hdr, frags))| {
                 let at = (k << sh) * w;
                 for f in frags {
                     let t = &tris[f.tri as usize];

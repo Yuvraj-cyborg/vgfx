@@ -60,3 +60,34 @@ where
     let mut none = [(); MAX_THREADS];
     each(threads, items, &mut none, |_, it| f(it));
 }
+
+/// `each`, with the items handed out dearest first by `cost` when there is
+/// more than one thread: the long pieces start first and the short ones fill
+/// in behind them. The order never changes a result.
+pub fn each_by_cost<I, T, S, C, F>(threads: usize, items: I, scratch: &mut [S], cost: C, f: F)
+where
+    I: Iterator<Item = T> + Send,
+    T: Send,
+    S: Send,
+    C: Fn(&T) -> usize,
+    F: Fn(&mut S, T) + Sync,
+{
+    if threads <= 1 || cfg!(target_arch = "wasm32") {
+        return each(1, items, scratch, f);
+    }
+    let mut all: Vec<T> = items.collect();
+    all.sort_by_cached_key(|it| core::cmp::Reverse(cost(it)));
+    each(threads, all.into_iter(), scratch, f);
+}
+
+/// `each_by_cost` for work that needs no scratch of its own.
+pub fn each0_by_cost<I, T, C, F>(threads: usize, items: I, cost: C, f: F)
+where
+    I: Iterator<Item = T> + Send,
+    T: Send,
+    C: Fn(&T) -> usize,
+    F: Fn(T) + Sync,
+{
+    let mut none = [(); MAX_THREADS];
+    each_by_cost(threads, items, &mut none, cost, |_, it| f(it));
+}

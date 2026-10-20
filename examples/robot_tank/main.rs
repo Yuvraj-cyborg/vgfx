@@ -1,7 +1,7 @@
 //! Renders the robot-to-tank film with the studio renderer, on the CPU, as
 //! raw RGB frames.
 //!
-//!   cargo run --release --example robot_tank -- [--size 1920x1080] [--fps 30] [--out film.rgb]
+//!   cargo run --release --example robot_tank -- [--size 1920x1080] [--fps 30] [--threads 1] [--out film.rgb]
 //!   ffmpeg -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 30 -i film.rgb -c:v libx264 -pix_fmt yuv420p film.mp4
 // The film's coordinates are measured, not constants (0.318 is a height,
 // not 1/pi), and it was written inside the studio module, under its rules.
@@ -34,12 +34,18 @@ fn main() {
         .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
         .expect("--size WxH");
     let fps: f32 = arg("--fps").map_or(30.0, |v| v.parse().expect("--fps"));
+    let threads: usize = arg("--threads").map_or(1, |v| v.parse().expect("--threads"));
     let out = arg("--out").unwrap_or_else(|| "film.rgb".into());
 
     let film = film::Transform::new();
     let (parts, triangles) = film.counts();
     eprintln!("{parts} parts, {triangles} triangles");
     let mut renderer = StudioRenderer::new(w, h);
+    // Each frame on as many threads as asked; the bytes are the same.
+    renderer.threads = threads;
+    // A film's meshes never change, so a frame where the lamp and every
+    // part stand still keeps the shadow map of the frame before.
+    renderer.mesh_generation = Some(1);
     let mut frame = Frame::default();
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("--out"));
     let frames = (film.seconds() * fps).round() as usize;
@@ -52,7 +58,7 @@ fn main() {
     file.flush().expect("write");
     let s = start.elapsed().as_secs_f64();
     eprintln!(
-        "{frames} frames of {w}x{h} in {s:.1} s, {:.0} ms a frame, one thread: {out}",
+        "{frames} frames of {w}x{h} in {s:.1} s, {:.0} ms a frame, {threads} thread(s): {out}",
         s * 1000.0 / frames as f64
     );
 }

@@ -154,7 +154,7 @@ mod tests {
         assert!(!m.idx.is_empty());
         // Every triangle faces away from the middle of the body.
         let mid = v3(0.0, 0.5, 0.0);
-        for t in m.idx.chunks_exact(3) {
+        for t in m.idx.as_chunks::<3>().0 {
             let (a, b, c) = (
                 m.pos[t[0] as usize],
                 m.pos[t[1] as usize],

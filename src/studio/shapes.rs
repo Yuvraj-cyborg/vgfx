@@ -1156,7 +1156,7 @@ mod tests {
             [3.0, 5.0],
             [0.0, 5.0],
         ];
-        solid(&[e.clone()], false, 10.0);
+        solid(std::slice::from_ref(&e), false, 10.0);
         let mut back = e;
         back.reverse();
         solid(&[back], false, 10.0);
